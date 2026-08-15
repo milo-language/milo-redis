@@ -1,0 +1,45 @@
+// RESP probe: prove the protocol shape before writing the client. RESP is
+// line-oriented and length-prefixed, so unlike postgres the risk here is not
+// framing — it is the RESP2/RESP3 split, where the same command answers with a
+// different type depending on the handshake.
+from "std/net" import { TcpStream, ip4 }
+
+fn send(s: &TcpStream, cmd: &Vec<string>): string {
+    var out: string = "*" + cmd.len().toString() + "\r\n"
+    for a in cmd {
+        out = out + "$" + a.len.toString() + "\r\n" + a + "\r\n"
+    }
+    let _n = s.send(out)!
+    return s.recvOnce()
+}
+
+fn show(label: &string, raw: &string): void {
+    var vis: string = ""
+    for i in 0..raw.len {
+        let c = raw[i]
+        if c == 13 as u8 {
+            vis = vis + "\\r"
+        } else if c == 10 as u8 {
+            vis = vis + "\\n"
+        } else {
+            vis.push(c)
+        }
+    }
+    print(label + vis)
+}
+
+fn main(): i32 {
+    let s = TcpStream.connect(ip4(127, 0, 0, 1), 56379)!
+    show("auth:   ", send(s, ["AUTH", "testpw"]))
+    show("ping:   ", send(s, ["PING"]))
+    show("set:    ", send(s, ["SET", "milo", "hello"]))
+    show("get:    ", send(s, ["GET", "milo"]))
+    show("missing:", send(s, ["GET", "nope"]))
+    show("int:    ", send(s, ["INCR", "counter"]))
+    show("list:   ", send(s, ["LPUSH", "l", "a", "b"]))
+    show("range:  ", send(s, ["LRANGE", "l", "0", "-1"]))
+    show("err:    ", send(s, ["INCR", "milo"]))
+    show("hello3: ", send(s, ["HELLO", "3"]))
+    show("map3:   ", send(s, ["CONFIG", "GET", "maxmemory"]))
+    return 0
+}
