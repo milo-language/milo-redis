@@ -1,0 +1,10 @@
+{
+  "name": "redis",
+  "version": "0.1.0",
+  "description": "Redis client — RESP2/RESP3, pipelining, pub/sub, pure Milo",
+  "license": "MIT",
+  "repository": "github.com/milo-language/milo-redis",
+  "lib": "lib.milo",
+  "targets": ["darwin", "linux"],
+  "exclude": ["tests/**", "examples/**", "scripts/**"]
+}
