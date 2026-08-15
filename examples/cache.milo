@@ -1,0 +1,179 @@
+// A tour of the client against a real server: connect, strings, hashes, lists,
+// sets, sorted sets, a pipeline, a transaction and pub/sub.
+//
+//   sh scripts/test-server.sh start
+//   milo run examples/cache.milo
+//   milo run examples/cache.milo "redis://:pw@host:6379/0"   # or your own
+from "../lib" import {
+    Conn, Pipeline, RedisError
+}
+from "std/args" import {
+    args
+}
+from "std/env" import {
+    Env
+}
+
+fn main(): i32 {
+    let argv = args()
+    var url = Env.getOr("MILO_REDIS_URL", "redis://:testpw@127.0.0.1:56379/0")
+    if argv.len() > 1 {
+        url = argv[1].clone()
+    }
+
+    var db = match Conn.connect(url) {
+        Result.Ok(c) => c
+        Result.Err(e) => {
+            print("could not connect: " + e.toString())
+            print("hint: start the test server with `sh scripts/test-server.sh start`")
+            return 1
+        }
+    }
+    print("connected to Redis " + db.serverVersionText() + " speaking RESP" + db.protocol().toString())
+
+    // ── Strings ──
+    db.set("milo:greeting", "hello")!
+    print("GET milo:greeting -> " + (db.get("milo:greeting")! ?? "<nil>"))
+    print("GET milo:absent   -> " + (db.get("milo:absent")! ?? "<nil>"))
+
+    let _ = db.delOne("milo:hits")!
+    let hits = db.incr("milo:hits")!
+    print("INCR milo:hits    -> " + hits.toString())
+
+    db.setEx("milo:session", 60, "token")!
+    print("TTL milo:session  -> " + db.ttl("milo:session")!.toString() + "s")
+
+    // ── Hashes ──
+    let _ = db.delOne("milo:user")!
+    let _ = db.hset("milo:user", "name", "ada")!
+    let _ = db.hset("milo:user", "role", "engineer")!
+    // HGETALL is a flat array under RESP2 and a map under RESP3. asPairs()
+    // flattens that difference away, which is why this prints the same either way.
+    for p in db.hgetall("milo:user")! {
+        print("  " + p.key + " = " + p.text())
+    }
+
+    // ── Lists ──
+    let _ = db.delOne("milo:queue")!
+    let _ = db.rpush("milo:queue", "first")!
+    let _ = db.rpush("milo:queue", "second")!
+    print("LRANGE milo:queue -> " + joinWith(db.lrange("milo:queue", 0, -1)!, ", "))
+
+    // ── Sorted sets ──
+    let _ = db.delOne("milo:scores")!
+    let _ = db.zadd("milo:scores", 99.5, "ada")!
+    let _ = db.zadd("milo:scores", 88.25, "grace")!
+    // ZSCORE is a bulk string under RESP2 and a double under RESP3 — one f64 here.
+    print("ZSCORE ada        -> " + (db.zscore("milo:scores", "ada")! ?? 0.0).toString())
+    print("ZRANGE milo:scores-> " + joinWith(db.zrange("milo:scores", 0, -1)!, ", "))
+
+    // ── Pipelining ──
+    // One write, one hundred commands. Against a network hop this is the whole
+    // difference between a fast client and a slow one.
+    let _ = db.delOne("milo:counter")!
+    var pipe = Pipeline.new()
+    let writesBefore = db.writeCount()
+    for i in 0..100 {
+        pipe.add(["INCR", "milo:counter"])
+    }
+    let replies = db.runPipeline(pipe)!
+    let last = match replies[replies.len() - 1] {
+        Result.Ok(v) => v.asI64() ?? 0
+        Result.Err(e) => {
+            print("pipeline failed: " + e.toString())
+            return 1
+        }
+    }
+    print("pipeline: " + replies.len().toString() + " replies, last = " + last.toString() + ", writes used = " + (db.writeCount() - writesBefore).toString())
+
+    // ── Transactions ──
+    let _ = db.delOne("milo:tx")!
+    db.multi()!
+    let _ = db.cmd(["SET", "milo:tx", "committed"])!
+    let _ = db.cmd(["INCR", "milo:hits"])!
+    let res = db.exec()!
+    print("EXEC: " + res.len().toString() + " replies, aborted = " + res.aborted.toString() + ", milo:tx = " + (db.get("milo:tx")! ?? "<nil>"))
+
+    db.multi()!
+    let _ = db.cmd(["SET", "milo:tx", "discarded"])!
+    db.discard()!
+    print("after DISCARD: milo:tx = " + (db.get("milo:tx")! ?? "<nil>"))
+
+    // ── An error, surfaced by prefix ──
+    // WRONGTYPE comes from a type mismatch, not from a bad value: INCR on a
+    // *string* key answers ERR "value is not an integer". It takes a key of the
+    // wrong container type — this list — to get WRONGTYPE.
+    match db.incr("milo:queue") {
+        Result.Ok(_) => {
+            print("expected INCR on a list key to fail")
+        }
+        Result.Err(e) => {
+            print("INCR on a list: kind = " + e.kind + ", message = " + e.message)
+        }
+    }
+
+    // ── Binary-safe values ──
+    // RESP bulk strings are length-prefixed, so a value is never scanned for a
+    // terminator: NUL bytes, invalid UTF-8 and an embedded CRLF all survive.
+    var blob: string = ""
+    blob.push(0 as u8)
+    blob.pushStr("after-nul")
+    blob.push(255 as u8)
+    blob.push(254 as u8)
+    blob.pushStr("\r\n$3\r\nfake")
+    blob.push(0 as u8)
+    let blobLen = blob.len
+    db.set("milo:binary", blob)!
+    let readBack = db.get("milo:binary")! ?? ""
+    print("binary round trip: wrote " + blobLen.toString() + " bytes, read " + readBack.len.toString() + " bytes, identical = " + sameBytes(readBack, blob).toString())
+
+    // ── Pub/sub ──
+    // Two connections: a subscriber cannot publish to itself under RESP2, where
+    // subscriber mode locks the connection down. Under RESP3 it could, but using
+    // two is what a real program does.
+    var sub = Conn.connect(url)!
+    sub.subscribe(["milo:news"])!
+    let delivered = db.publish("milo:news", "hello subscribers")!
+    print("PUBLISH reached " + delivered.toString() + " subscriber(s)")
+    match sub.nextMessage(2000)! {
+        Option.Some(m) => {
+            print("received on " + m.channel + ": " + m.payload)
+        }
+        Option.None => {
+            print("no message arrived within 2s")
+            sub.close()
+            db.close()
+            return 1
+        }
+    }
+    sub.close()
+
+    db.close()
+    print("done")
+    return 0
+}
+
+// Byte-for-byte comparison; `==` on strings would do too, but spelling it out
+// makes the claim in the output unambiguous.
+fn sameBytes(a: &string, b: &string): bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn joinWith(items: &Vec<string>, sep: &string): string {
+    var out: string = ""
+    for i in 0..items.len() {
+        if i > 0 {
+            out.pushStr(sep)
+        }
+        out.pushStr(items[i])
+    }
+    return out
+}

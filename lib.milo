@@ -1,0 +1,1950 @@
+// milo-redis — a Redis client for Milo, speaking RESP directly.
+//
+// No hiredis: RESP is a one-byte type tag plus CRLF-delimited payload, so the
+// only dependency is std. Milo's `string` is an owned byte buffer that carries
+// embedded NULs and non-UTF-8 unharmed, which is what makes it usable as both
+// the wire buffer and the value type here — see docs/wire-notes.md.
+//
+//   var c = Conn.connect("redis://:pw@127.0.0.1:6379/0")!
+//   c.set("greeting", "hello")!
+//   print(c.get("greeting")! ?? "<nil>")
+//   c.close()
+//
+// THE DESIGN CONSTRAINT: RESP3 changes the reply TYPE for identical commands.
+// `CONFIG GET maxmemory` is a flat array under RESP2 and a map under RESP3;
+// `ZSCORE` is a bulk string under RESP2 and a double under RESP3; `SMEMBERS` is
+// an array under RESP2 and a set under RESP3. So this client never decodes a
+// reply by command name — it decodes the wire type it actually received, and
+// `RedisValue` can represent every type both protocols can send. The connection
+// attempts `HELLO 3` and falls back to RESP2 when the server has no `HELLO`
+// (Redis < 6); `protocol()` reports which one is live, and `asPairs()` /
+// `asStrings()` give protocol-independent shapes to callers who do not care.
+
+from "std/net" import {
+    TcpStream, resolve
+}
+from "std/time" import {
+    Duration
+}
+from "std/timer" import {
+    waitReadable
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+// A failure, either from the server or from this side of the socket.
+//
+// `kind` is the error's first word, which for a server error is Redis's error
+// prefix: WRONGTYPE, NOAUTH, MOVED, ERR, … That prefix is the stable part —
+// message text gets reworded between releases and is localised by some proxies —
+// so it is what a caller should branch on. Client-side failures use the three
+// kinds CONNECTION, PROTOCOL and CLIENT, which Redis itself never sends.
+pub struct RedisError {
+    kind: string,
+    message: string,
+}
+
+impl RedisError {
+    fn make(kind: &string, message: &string): RedisError {
+        return RedisError {
+            kind: kind.clone(), message: message.clone()
+        }
+    }
+
+    // The socket failed, or the peer went away.
+    fn connection(message: &string): RedisError {
+        return RedisError.make("CONNECTION", message)
+    }
+
+    // The bytes on the wire are not RESP, or not the RESP we expected here.
+    // Distinct from CONNECTION because it means the stream is desynchronised:
+    // the connection must be discarded, not retried on.
+    fn protocol(message: &string): RedisError {
+        return RedisError.make("PROTOCOL", message)
+    }
+
+    // The caller asked for something impossible before any bytes moved.
+    fn client(message: &string): RedisError {
+        return RedisError.make("CLIENT", message)
+    }
+
+    // Decode an error line, `WRONGTYPE Operation against a key holding …`.
+    // Redis always puts the prefix first, space-separated; a line with no space
+    // is all prefix.
+    fn fromWire(line: &string): RedisError {
+        match line.indexOf(" ") {
+            Option.Some(sp) => {
+                return RedisError {
+                    kind: line.substr(0, sp), message: line.substr(sp + 1, line.len)
+                }
+            }
+            Option.None => {
+                return RedisError {
+                    kind: line.clone(), message: ""
+                }
+            }
+        }
+    }
+
+    // True when this came from our side rather than from Redis. The parser uses
+    // it to decide whether it may keep reading: a server error is one element of
+    // a well-formed frame and the rest of that frame is still in the socket, but
+    // a CONNECTION or PROTOCOL failure means there is nothing left to read.
+    fn isLocal(self: &Self): bool {
+        return self.kind == "CONNECTION" || self.kind == "PROTOCOL" || self.kind == "CLIENT"
+    }
+
+    fn isServer(self: &Self): bool {
+        return !self.isLocal()
+    }
+
+    fn clone(self: &Self): RedisError {
+        return RedisError {
+            kind: self.kind.clone(), message: self.message.clone()
+        }
+    }
+
+    fn toString(self: &Self): string {
+        if self.message.len == 0 {
+            return self.kind.clone()
+        }
+        return self.kind + ": " + self.message
+    }
+}
+
+// ── Values ───────────────────────────────────────────────────────────────────
+
+// One reply, in the shape the wire actually used.
+//
+// The RESP2 subset is Nil / Str / Int / Array. RESP3 adds Float (`,`),
+// Bool (`#`), BigNum (`(`), Verbatim (`=`), Map (`%`), Set (`~`) and Push (`>`),
+// and it sends `_` for null where RESP2 sends `$-1` / `*-1` — both land on Nil.
+//
+// Map holds its entries FLATTENED as key, value, key, value, … rather than as a
+// list of pairs. Two reasons: it is exactly the RESP2 shape of the same reply
+// (`CONFIG GET` and `HGETALL` answer a flat array under RESP2 and a map under
+// RESP3), so `asPairs()` can give one answer for both without a second code
+// path; and Redis map keys are values, not strings, so a `HashMap<string, _>`
+// would be a lossy container that also loses the server's ordering.
+//
+// There is no error variant: a server error is returned as `Result.Err`, so a
+// caller cannot accidentally treat a failure as data. Inside an aggregate — the
+// EXEC reply is the only place Redis puts one — the whole frame is still read
+// off the socket before the error is reported, so the connection stays in sync.
+// `exec()` and `runPipeline()` return a `Result` per element for that case.
+pub enum RedisValue {
+    Nil,
+    Str(string),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    BigNum(string),
+    Verbatim(string),
+    Array(Vec<RedisValue>),
+    Map(Vec<RedisValue>),
+    Set(Vec<RedisValue>),
+    Push(Vec<RedisValue>),
+}
+
+// One entry of a map-shaped reply, as produced by `asPairs()`.
+pub struct Pair {
+    key: string,
+    value: RedisValue,
+}
+
+impl Pair {
+    fn text(self: &Self): string {
+        return self.value.text()
+    }
+
+    fn clone(self: &Self): Pair {
+        return Pair {
+            key: self.key.clone(), value: self.value.clone()
+        }
+    }
+}
+
+fn cloneItems(src: &Vec<RedisValue>): Vec<RedisValue> {
+    var out: Vec<RedisValue> = Vec.new()
+    for v in src {
+        out.push(v.clone())
+    }
+    return out
+}
+
+impl RedisValue {
+    // Enums get no derived clone in Milo, and every accessor here hands out an
+    // owned value (references are second-class, so a borrowed element could not
+    // be returned). Rebuilding the variant is that clone.
+    fn clone(self: &Self): RedisValue {
+        match self {
+            RedisValue.Nil => {
+                return RedisValue.Nil
+            }
+            RedisValue.Str(s) => {
+                return RedisValue.Str(s.clone())
+            }
+            RedisValue.Int(n) => {
+                return RedisValue.Int(n)
+            }
+            RedisValue.Float(f) => {
+                return RedisValue.Float(f)
+            }
+            RedisValue.Bool(b) => {
+                return RedisValue.Bool(b)
+            }
+            RedisValue.BigNum(s) => {
+                return RedisValue.BigNum(s.clone())
+            }
+            RedisValue.Verbatim(s) => {
+                return RedisValue.Verbatim(s.clone())
+            }
+            RedisValue.Array(v) => {
+                return RedisValue.Array(cloneItems(v))
+            }
+            RedisValue.Map(v) => {
+                return RedisValue.Map(cloneItems(v))
+            }
+            RedisValue.Set(v) => {
+                return RedisValue.Set(cloneItems(v))
+            }
+            RedisValue.Push(v) => {
+                return RedisValue.Push(cloneItems(v))
+            }
+        }
+    }
+
+    fn isNil(self: &Self): bool {
+        match self {
+            RedisValue.Nil => {
+                return true
+            }
+            _ => {
+                return false
+            }
+        }
+    }
+
+    // The wire type's name, for diagnostics and for tests that assert a reply
+    // really did arrive as a map rather than an array.
+    fn typeName(self: &Self): string {
+        match self {
+            RedisValue.Nil => {
+                return "nil"
+            }
+            RedisValue.Str(_) => {
+                return "string"
+            }
+            RedisValue.Int(_) => {
+                return "integer"
+            }
+            RedisValue.Float(_) => {
+                return "double"
+            }
+            RedisValue.Bool(_) => {
+                return "boolean"
+            }
+            RedisValue.BigNum(_) => {
+                return "bignum"
+            }
+            RedisValue.Verbatim(_) => {
+                return "verbatim"
+            }
+            RedisValue.Array(_) => {
+                return "array"
+            }
+            RedisValue.Map(_) => {
+                return "map"
+            }
+            RedisValue.Set(_) => {
+                return "set"
+            }
+            RedisValue.Push(_) => {
+                return "push"
+            }
+        }
+    }
+
+    // A string, when the reply IS one. Nil stays None — that distinction is the
+    // whole point of the type: `$-1` (key absent) and `$0` (key present, empty
+    // value) are different answers and clients that conflate them report a
+    // missing key as an empty string.
+    fn asStr(self: &Self): Option<string> {
+        match self {
+            RedisValue.Str(s) => {
+                return Option.Some(s.clone())
+            }
+            RedisValue.Verbatim(s) => {
+                return Option.Some(s.clone())
+            }
+            RedisValue.BigNum(s) => {
+                return Option.Some(s.clone())
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn asI64(self: &Self): Option<i64> {
+        match self {
+            RedisValue.Int(n) => {
+                return Option.Some(n)
+            }
+            RedisValue.Bool(b) => {
+                return Option.Some(if b {
+                    1
+                } else {
+                    0
+                }
+                )
+            }
+            RedisValue.Str(s) => {
+                return s.parseInt()
+            }
+            RedisValue.BigNum(s) => {
+                // Only when it fits; a genuine big number is why the variant
+                // keeps its digits as text.
+                return s.parseInt()
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    // Accepts both protocols' spellings of a score: RESP3 sends `,1.5`, RESP2
+    // sends the bulk string `1.5` for the very same ZSCORE.
+    fn asF64(self: &Self): Option<f64> {
+        match self {
+            RedisValue.Float(f) => {
+                return Option.Some(f)
+            }
+            RedisValue.Int(n) => {
+                return Option.Some(n as f64)
+            }
+            RedisValue.Str(s) => {
+                return parseDouble(s)
+            }
+            RedisValue.Verbatim(s) => {
+                return parseDouble(s)
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    // Accepts both spellings again: RESP3 `#t`, RESP2 `:1`.
+    fn asBool(self: &Self): Option<bool> {
+        match self {
+            RedisValue.Bool(b) => {
+                return Option.Some(b)
+            }
+            RedisValue.Int(n) => {
+                return Option.Some(n != 0)
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    // A display rendering of a scalar. Bool renders as RESP2 would have sent it
+    // so a program's output does not change with the handshake.
+    fn text(self: &Self): string {
+        match self {
+            RedisValue.Nil => {
+                return ""
+            }
+            RedisValue.Str(s) => {
+                return s.clone()
+            }
+            RedisValue.Int(n) => {
+                return n.toString()
+            }
+            RedisValue.Float(f) => {
+                return f.toString()
+            }
+            RedisValue.Bool(b) => {
+                return if b {
+                    "1"
+                } else {
+                    "0"
+                }
+            }
+            RedisValue.BigNum(s) => {
+                return s.clone()
+            }
+            RedisValue.Verbatim(s) => {
+                return s.clone()
+            }
+            _ => {
+                return self.toString()
+            }
+        }
+    }
+
+    // The elements of any aggregate; empty for a scalar. Set, Array and Push all
+    // land here, so a caller reading SMEMBERS does not care that RESP3 answered
+    // with `~` and RESP2 with `*`.
+    fn items(self: &Self): Vec<RedisValue> {
+        match self {
+            RedisValue.Array(v) => {
+                return cloneItems(v)
+            }
+            RedisValue.Map(v) => {
+                return cloneItems(v)
+            }
+            RedisValue.Set(v) => {
+                return cloneItems(v)
+            }
+            RedisValue.Push(v) => {
+                return cloneItems(v)
+            }
+            _ => {
+                return Vec.new()
+            }
+        }
+    }
+
+    fn len(self: &Self): i64 {
+        match self {
+            RedisValue.Array(v) => {
+                return v.len()
+            }
+            RedisValue.Map(v) => {
+                return v.len() / 2
+            }
+            RedisValue.Set(v) => {
+                return v.len()
+            }
+            RedisValue.Push(v) => {
+                return v.len()
+            }
+            _ => {
+                return 0
+            }
+        }
+    }
+
+    // Every element rendered as text. For LRANGE / SMEMBERS / KEYS, which are
+    // arrays of bulk strings in both protocols.
+    fn asStrings(self: &Self): Vec<string> {
+        var out: Vec<string> = Vec.new()
+        for v in self.items() {
+            out.push(v.text())
+        }
+        return out
+    }
+
+    // THE PROTOCOL-INDEPENDENCE HELPER. A RESP2 flat array of k, v, k, v … and
+    // a RESP3 map of the same content give the same answer, so a caller reading
+    // CONFIG GET or HGETALL never has to ask which protocol is live.
+    //
+    // A trailing odd element (which Redis never sends) is dropped rather than
+    // paired with a fabricated value.
+    fn asPairs(self: &Self): Vec<Pair> {
+        var out: Vec<Pair> = Vec.new()
+        let flat = self.items()
+        var i: i64 = 0
+        while i + 1 < flat.len() {
+            out.push(Pair {
+                key: flat[i].text(), value: flat[i + 1].clone()
+            }
+            )
+            i = i + 2
+        }
+        return out
+    }
+
+    // Look a key up in a map-shaped reply, without materialising the pairs.
+    fn get(self: &Self, key: &string): Option<RedisValue> {
+        let flat = self.items()
+        var i: i64 = 0
+        while i + 1 < flat.len() {
+            if flat[i].text() == key {
+                return Option.Some(flat[i + 1].clone())
+            }
+            i = i + 2
+        }
+        return Option.None
+    }
+
+    // A debug rendering. Aggregates keep their wire type visible — `{…}` for a
+    // map, `~{…}` for a set — because "which type did this arrive as" is the
+    // question this client exists to answer.
+    fn toString(self: &Self): string {
+        match self {
+            RedisValue.Nil => {
+                return "nil"
+            }
+            RedisValue.Str(s) => {
+                return "\"" + s + "\""
+            }
+            RedisValue.Int(n) => {
+                return n.toString()
+            }
+            RedisValue.Float(f) => {
+                return f.toString()
+            }
+            RedisValue.Bool(b) => {
+                return b.toString()
+            }
+            RedisValue.BigNum(s) => {
+                return s.clone()
+            }
+            RedisValue.Verbatim(s) => {
+                return "\"" + s + "\""
+            }
+            RedisValue.Array(v) => {
+                return renderList("[", v, "]")
+            }
+            RedisValue.Map(v) => {
+                return renderList("{", v, "}")
+            }
+            RedisValue.Set(v) => {
+                return renderList("~[", v, "]")
+            }
+            RedisValue.Push(v) => {
+                return renderList(">[", v, "]")
+            }
+        }
+    }
+}
+
+fn renderList(open: &string, items: &Vec<RedisValue>, close: &string): string {
+    var out = open.clone()
+    var first = true
+    for v in items {
+        if !first {
+            out.pushStr(", ")
+        }
+        first = false
+        out.pushStr(v.toString())
+    }
+    out.pushStr(close)
+    return out
+}
+
+// RESP3 doubles include the three names that `parseF64` does not accept, and
+// Redis really does send them: `,inf` is what ZSCORE returns for a member added
+// with `+inf`.
+fn parseDouble(s: &string): Option<f64> {
+    if s == "inf" || s == "+inf" || s == "infinity" {
+        return Option.Some(f64.INF)
+    }
+    if s == "-inf" || s == "-infinity" {
+        return Option.Some(f64.NEG_INF)
+    }
+    if s == "nan" {
+        return Option.Some(f64.NAN)
+    }
+    return s.parseF64()
+}
+
+// ── Request encoding ─────────────────────────────────────────────────────────
+
+// A command as a RESP array of bulk strings. Length-prefixed, never quoted or
+// escaped, which is what makes an argument containing spaces, CRLF or NUL bytes
+// a single argument rather than an injection: the server reads exactly the
+// number of bytes announced and never re-tokenises them.
+pub fn encodeCommand(args: &Vec<string>): string {
+    var out: string = "*"
+    out.pushStr(args.len().toString())
+    out.pushStr("\r\n")
+    for a in args {
+        out.pushStr("$")
+        out.pushStr(a.len.toString())
+        out.pushStr("\r\n")
+        out.pushStr(a)
+        out.pushStr("\r\n")
+    }
+    return out
+}
+
+// ── Transport and parser ─────────────────────────────────────────────────────
+
+// The socket plus a read buffer, so a caller never sees half a frame.
+//
+// `writes` and `reads` count syscalls, not commands. They are the evidence that
+// pipelining does what it claims: N pipelined commands are one write and
+// (normally) one read, where N separate commands are N of each. Tests assert on
+// them; see `Conn.writeCount()`.
+struct RespStream {
+    tcp: TcpStream,
+    buf: string,
+    pos: i64,
+    depth: i64,
+    writes: i64,
+    reads: i64,
+}
+
+// A hostile or corrupt length prefix must not make the reader loop forever or
+// allocate the machine to death. 512 MiB is Redis's own proto-max-bulk-len
+// ceiling, so nothing legitimate exceeds it.
+fn maxBulkLen(): i64 {
+    return 536870912
+}
+
+// Deep enough for any real reply (the deepest Redis sends is HELLO's map of
+// arrays of maps, at 3), shallow enough that a malicious `*1` chain cannot blow
+// the parser's stack.
+fn maxDepth(): i64 {
+    return 64
+}
+
+impl RespStream {
+    fn wrap(tcp: TcpStream): RespStream {
+        return RespStream {
+            tcp: tcp, buf: "", pos: 0, depth: 0, writes: 0, reads: 0
+        }
+    }
+
+    // Write every byte. A single send() is allowed to write short — a pipeline
+    // of a thousand commands will — so the loop is not optional.
+    fn sendAll(self: &mut Self, data: &string): Result<Unit, RedisError> {
+        var sent: i64 = 0
+        while sent < data.len {
+            // The whole-buffer case is the common one and copies nothing; only a
+            // short write pays for a tail copy.
+            var n: i64 = 0
+            if sent == 0 {
+                n = self.tcp.send(data) ?? -1
+            } else {
+                let chunk = data.substr(sent, data.len)
+                n = self.tcp.send(chunk) ?? -1
+            }
+            self.writes = self.writes + 1
+            if n <= 0 {
+                return Result.Err(RedisError.connection("send failed: connection lost"))
+            }
+            sent = sent + n
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // One read into the buffer. False means the peer closed.
+    fn fill(self: &mut Self): bool {
+        let chunk = self.tcp.recvOnce()
+        self.reads = self.reads + 1
+        if chunk.len == 0 {
+            return false
+        }
+        self.buf.pushStr(chunk)
+        return true
+    }
+
+    fn buffered(self: &Self): i64 {
+        return self.buf.len - self.pos
+    }
+
+    fn ensure(self: &mut Self, n: i64): bool {
+        while self.buffered() < n {
+            if !self.fill() {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Drop the consumed prefix at a frame boundary, so a long-lived connection
+    // does not accumulate every byte it ever read. Only above a threshold: below
+    // it the copy costs more than the memory.
+    fn compact(self: &mut Self): void {
+        if self.pos == self.buf.len {
+            self.buf = ""
+            self.pos = 0
+        } else if self.pos > 65536 {
+            let rest = self.buf.substr(self.pos, self.buf.len)
+            self.buf = rest
+            self.pos = 0
+        }
+    }
+
+    // One CRLF-terminated line, without the CRLF.
+    fn readLine(self: &mut Self): Result<string, RedisError> {
+        var i = self.pos
+        while true {
+            if i + 1 < self.buf.len {
+                if self.buf[i] == 13 as u8 && self.buf[i + 1] == 10 as u8 {
+                    let line = self.buf.substr(self.pos, i)
+                    self.pos = i + 2
+                    return Result.Ok(line)
+                }
+                i = i + 1
+                if i - self.pos > maxBulkLen() {
+                    return Result.Err(RedisError.protocol("reply line exceeds 512 MiB"))
+                }
+            } else if !self.fill() {
+                return Result.Err(RedisError.connection("connection closed mid-reply"))
+            }
+        }
+        return Result.Err(RedisError.protocol("unreachable"))
+    }
+
+    fn readTag(self: &mut Self): Result<u8, RedisError> {
+        if !self.ensure(1) {
+            return Result.Err(RedisError.connection("connection closed before reply"))
+        }
+        let t = self.buf[self.pos]
+        self.pos = self.pos + 1
+        return Result.Ok(t)
+    }
+
+    // The integer after a type tag: an element count, or a bulk length. -1 is
+    // RESP2's null and is passed through for the caller to interpret.
+    fn readCount(self: &mut Self): Result<i64, RedisError> {
+        let line = self.readLine()?
+        let Option.Some(n) = line.parseInt() else {
+            return Result.Err(RedisError.protocol("expected a count, got '" + line + "'"))
+        }
+        if n < -1 || n > maxBulkLen() {
+            return Result.Err(RedisError.protocol("out-of-range count " + n.toString()))
+        }
+        return Result.Ok(n)
+    }
+
+    // `n` bytes followed by CRLF. Binary-safe: the bytes are copied out by
+    // length and never scanned for a terminator, so a value containing NULs,
+    // CRLFs or invalid UTF-8 round-trips exactly.
+    fn readBulk(self: &mut Self, n: i64): Result<string, RedisError> {
+        if !self.ensure(n + 2) {
+            return Result.Err(RedisError.connection("connection closed mid-bulk"))
+        }
+        let body = self.buf.substr(self.pos, self.pos + n)
+        if self.buf[self.pos + n] != 13 as u8 || self.buf[self.pos + n + 1] != 10 as u8 {
+            return Result.Err(RedisError.protocol("bulk string not terminated by CRLF"))
+        }
+        self.pos = self.pos + n + 2
+        return Result.Ok(body)
+    }
+
+    // Read one complete frame.
+    //
+    // A server error anywhere in the frame is returned as Err, but ONLY after
+    // the whole frame has been consumed — leaving a half-read aggregate in the
+    // socket would desynchronise every later reply, which is the classic way a
+    // client starts answering the previous question. A local error (CONNECTION,
+    // PROTOCOL) aborts immediately: there is nothing left to drain.
+    fn readValue(self: &mut Self): Result<RedisValue, RedisError> {
+        // Attribute frames (`|`) are metadata attached to the next reply, not a
+        // reply. v0.1 skips them, so the loop repeats until a real type appears.
+        var attrs: i64 = 0
+        while attrs < 8 {
+            let tag = self.readTag()?
+            if tag != 124 as u8 {
+                let v = self.readBody(tag)
+                if self.depth == 0 {
+                    self.compact()
+                }
+                return v
+            }
+            let n = self.readCount()?
+            if n > 0 {
+                let _ = self.readElements(n * 2)?
+            }
+            attrs = attrs + 1
+        }
+        return Result.Err(RedisError.protocol("more than 8 stacked attribute frames"))
+    }
+
+    fn readBody(self: &mut Self, tag: u8): Result<RedisValue, RedisError> {
+        if tag == 43 as u8 {
+            // '+' simple string
+            let line = self.readLine()?
+            return Result.Ok(RedisValue.Str(line))
+        }
+        if tag == 45 as u8 {
+            // '-' error
+            let line = self.readLine()?
+            return Result.Err(RedisError.fromWire(line))
+        }
+        if tag == 58 as u8 {
+            // ':' integer
+            let line = self.readLine()?
+            let Option.Some(n) = line.parseInt() else {
+                return Result.Err(RedisError.protocol("bad integer reply '" + line + "'"))
+            }
+            return Result.Ok(RedisValue.Int(n))
+        }
+        if tag == 44 as u8 {
+            // ',' double (RESP3)
+            let line = self.readLine()?
+            let Option.Some(f) = parseDouble(line) else {
+                return Result.Err(RedisError.protocol("bad double reply '" + line + "'"))
+            }
+            return Result.Ok(RedisValue.Float(f))
+        }
+        if tag == 35 as u8 {
+            // '#' boolean (RESP3)
+            let line = self.readLine()?
+            if line != "t" && line != "f" {
+                return Result.Err(RedisError.protocol("bad boolean reply '" + line + "'"))
+            }
+            return Result.Ok(RedisValue.Bool(line == "t"))
+        }
+        if tag == 40 as u8 {
+            // '(' big number (RESP3) — kept as text, since it is by definition
+            // wider than i64.
+            let line = self.readLine()?
+            return Result.Ok(RedisValue.BigNum(line))
+        }
+        if tag == 95 as u8 {
+            // '_' null (RESP3)
+            let line = self.readLine()?
+            if line.len != 0 {
+                return Result.Err(RedisError.protocol("null reply with a payload"))
+            }
+            return Result.Ok(RedisValue.Nil)
+        }
+        if tag == 36 as u8 {
+            // '$' bulk string; -1 is RESP2's null
+            let n = self.readCount()?
+            if n < 0 {
+                return Result.Ok(RedisValue.Nil)
+            }
+            let body = self.readBulk(n)?
+            return Result.Ok(RedisValue.Str(body))
+        }
+        if tag == 61 as u8 {
+            // '=' verbatim string (RESP3): `<len>\r\ntxt:<text>`. The three-byte
+            // format hint is advisory (it tells a terminal whether to render the
+            // text as markdown) and v0.1 drops it, keeping only the text.
+            let n = self.readCount()?
+            if n < 0 {
+                return Result.Ok(RedisValue.Nil)
+            }
+            let body = self.readBulk(n)?
+            if body.len >= 4 && body[3] == 58 as u8 {
+                return Result.Ok(RedisValue.Verbatim(body.substr(4, body.len)))
+            }
+            return Result.Ok(RedisValue.Verbatim(body))
+        }
+        if tag == 42 as u8 || tag == 126 as u8 || tag == 62 as u8 {
+            // '*' array, '~' set, '>' push. -1 is RESP2's null array.
+            let n = self.readCount()?
+            if n < 0 {
+                return Result.Ok(RedisValue.Nil)
+            }
+            let items = self.readElements(n)?
+            if tag == 126 as u8 {
+                return Result.Ok(RedisValue.Set(items))
+            }
+            if tag == 62 as u8 {
+                return Result.Ok(RedisValue.Push(items))
+            }
+            return Result.Ok(RedisValue.Array(items))
+        }
+        if tag == 37 as u8 {
+            // '%' map (RESP3): the count is PAIRS, so twice that many elements.
+            let n = self.readCount()?
+            if n < 0 {
+                return Result.Ok(RedisValue.Nil)
+            }
+            let items = self.readElements(n * 2)?
+            return Result.Ok(RedisValue.Map(items))
+        }
+        var hex: string = "0x"
+        hex.pushStr((tag as i64).toString())
+        return Result.Err(RedisError.protocol("unknown reply type byte " + hex + " — stream is out of sync"))
+    }
+
+    // `n` elements, always all of them. A server error in one element is held
+    // and reported once the rest have been drained.
+    fn readElements(self: &mut Self, n: i64): Result<Vec<RedisValue>, RedisError> {
+        if self.depth >= maxDepth() {
+            return Result.Err(RedisError.protocol("reply nested deeper than 64 levels"))
+        }
+        self.depth = self.depth + 1
+        var items: Vec<RedisValue> = Vec.new()
+        var failed = false
+        var firstErr = RedisError.protocol("")
+        for _i in 0..n {
+            match self.readValue() {
+                Result.Ok(v) => {
+                    items.push(v)
+                }
+                Result.Err(e) => {
+                    if e.isLocal() {
+                        self.depth = self.depth - 1
+                        return Result.Err(e)
+                    }
+                    if !failed {
+                        failed = true
+                        firstErr = e
+                    }
+                    // Keep the element count right so the caller's view of the
+                    // aggregate matches the wire.
+                    items.push(RedisValue.Nil)
+                }
+            }
+        }
+        self.depth = self.depth - 1
+        if failed {
+            return Result.Err(firstErr)
+        }
+        return Result.Ok(items)
+    }
+
+    // Close the socket. Assigning over the field runs the old value's Drop,
+    // which is what actually closes the descriptor.
+    fn shutdown(self: &mut Self): void {
+        self.tcp = TcpStream {
+            fd: -1 as i32
+        }
+        self.buf = ""
+        self.pos = 0
+    }
+}
+
+// ── Connection URL ───────────────────────────────────────────────────────────
+
+// A parsed `redis://` URL. Public so a caller can build one without string
+// surgery, and so the parsing rules are testable on their own.
+pub struct RedisUrl {
+    host: string,
+    port: u16,
+    username: string,
+    password: string,
+    db: i64,
+    protocol: i32,
+    clientName: string,
+}
+
+fn hexVal(c: u8): u8 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return c - 48 as u8
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return c - 97 as u8 + 10 as u8
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return c - 65 as u8 + 10 as u8
+    }
+    return 0 as u8
+}
+
+// Applied to the userinfo. A password with an `@`, `/` or `#` in it is common
+// and has to be written percent-encoded in a URL; not decoding it produces an
+// authentication failure with no clue why.
+fn percentDecode(s: &string): string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < s.len {
+        if s[i] == 37 as u8 && i + 2 < s.len {
+            out.push(((hexVal(s[i + 1]) << 4) | hexVal(s[i + 2])) as u8)
+            i = i + 3
+        } else {
+            out.push(s[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Parse `redis://[[user]:password@]host[:port][/db][?protocol=2]`.
+//
+// Recognised query parameters: `protocol` (2 or 3) and `client_name`. Anything
+// else is ignored rather than rejected — a URL is often shared with other tools,
+// and failing on a parameter meant for someone else helps nobody.
+pub fn parseUrl(url: &string): Result<RedisUrl, RedisError> {
+    var out = RedisUrl {
+        host: "127.0.0.1", port: 6379 as u16, username: "", password: "",
+        db: 0, protocol: 3 as i32, clientName: ""
+    }
+    let Option.Some(schemeEnd) = url.indexOf("://") else {
+        return Result.Err(RedisError.client("invalid URL: expected redis://[:password@]host:port[/db]"))
+    }
+    let scheme = url.substr(0, schemeEnd)
+    if scheme == "rediss" {
+        // Saying so beats a TLS handshake failure that looks like a protocol bug.
+        return Result.Err(RedisError.client("rediss:// (TLS) is not implemented in v0.1"))
+    }
+    if scheme != "redis" {
+        return Result.Err(RedisError.client("invalid URL scheme '" + scheme + "': expected redis://"))
+    }
+    var rest = url.substr(schemeEnd + 3, url.len)
+
+    var query: string = ""
+    match rest.indexOf("?") {
+        Option.Some(q) => {
+            query = rest.substr(q + 1, rest.len)
+            rest = rest.substr(0, q)
+        }
+        Option.None => {
+        }
+    }
+
+    // path = database number
+    match rest.indexOf("/") {
+        Option.Some(p) => {
+            let dbText = rest.substr(p + 1, rest.len)
+            rest = rest.substr(0, p)
+            if dbText.len > 0 {
+                let Option.Some(d) = dbText.parseInt() else {
+                    return Result.Err(RedisError.client("invalid database '" + dbText + "' in URL"))
+                }
+                if d < 0 {
+                    return Result.Err(RedisError.client("invalid database '" + dbText + "' in URL"))
+                }
+                out.db = d
+            }
+        }
+        Option.None => {
+        }
+    }
+
+    // userinfo — split on the LAST '@', because a password may legitimately
+    // contain one when it was not percent-encoded.
+    match rest.lastIndexOf("@") {
+        Option.Some(at) => {
+            let userinfo = rest.substr(0, at)
+            rest = rest.substr(at + 1, rest.len)
+            match userinfo.indexOf(":") {
+                Option.Some(c) => {
+                    out.username = percentDecode(userinfo.substr(0, c))
+                    out.password = percentDecode(userinfo.substr(c + 1, userinfo.len))
+                }
+                Option.None => {
+                    // `redis://secret@host` — no colon means the whole userinfo
+                    // is the password, which is how redis-cli reads it too.
+                    out.password = percentDecode(userinfo)
+                }
+            }
+        }
+        Option.None => {
+        }
+    }
+
+    if rest.len > 0 {
+        if rest[0] == 91 as u8 {
+            return Result.Err(RedisError.client("IPv6 literals in a URL are not supported in v0.1"))
+        }
+        match rest.lastIndexOf(":") {
+            Option.Some(c) => {
+                let portText = rest.substr(c + 1, rest.len)
+                let Option.Some(p) = portText.parseInt() else {
+                    return Result.Err(RedisError.client("invalid port '" + portText + "' in URL"))
+                }
+                if p <= 0 || p > 65535 {
+                    return Result.Err(RedisError.client("invalid port '" + portText + "' in URL"))
+                }
+                out.port = p as u16
+                out.host = rest.substr(0, c)
+            }
+            Option.None => {
+                out.host = rest.clone()
+            }
+        }
+    }
+    if out.host.len == 0 {
+        out.host = "127.0.0.1"
+    }
+
+    for pair in query.split("&") {
+        if pair.len == 0 {
+            continue
+        }
+        var k = pair.clone()
+        var v: string = ""
+        match pair.indexOf("=") {
+            Option.Some(e) => {
+                k = pair.substr(0, e)
+                v = percentDecode(pair.substr(e + 1, pair.len))
+            }
+            Option.None => {
+            }
+        }
+        if k == "protocol" || k == "resp" {
+            if v == "2" {
+                out.protocol = 2 as i32
+            } else if v == "3" {
+                out.protocol = 3 as i32
+            } else {
+                return Result.Err(RedisError.client("protocol must be 2 or 3, got '" + v + "'"))
+            }
+        } else if k == "client_name" {
+            out.clientName = v
+        } else if k == "db" {
+            let Option.Some(d) = v.parseInt() else {
+                return Result.Err(RedisError.client("invalid database '" + v + "' in URL"))
+            }
+            out.db = d
+        }
+    }
+    return Result.Ok(out)
+}
+
+// ── Pipelining ───────────────────────────────────────────────────────────────
+
+// A batch of commands to send in one write.
+//
+// This is the single biggest performance lever a Redis client has. N separate
+// commands cost N round trips, and against anything but a loopback socket the
+// round trip dominates everything else; the same N pipelined cost one. Build a
+// Pipeline, hand it to `Conn.runPipeline`, get N replies back in order.
+//
+// A Pipeline holds no connection: references are second-class in Milo, so it
+// could not store one, and not storing one means a batch can be built anywhere
+// and run against whichever connection is free.
+pub struct Pipeline {
+    encoded: string,
+    count: i64,
+}
+
+impl Pipeline {
+    fn new(): Pipeline {
+        return Pipeline {
+            encoded: "", count: 0
+        }
+    }
+
+    fn add(self: &mut Self, args: &Vec<string>): void {
+        self.encoded.pushStr(encodeCommand(args))
+        self.count = self.count + 1
+    }
+
+    fn len(self: &Self): i64 {
+        return self.count
+    }
+
+    fn isEmpty(self: &Self): bool {
+        return self.count == 0
+    }
+
+    fn clear(self: &mut Self): void {
+        self.encoded = ""
+        self.count = 0
+    }
+}
+
+// The outcome of an EXEC.
+//
+// `aborted` is not the same as a failure: a transaction guarded by WATCH whose
+// key changed answers with a null, meaning nothing ran. Collapsing that into an
+// error would tell a caller the transaction broke when in fact it was correctly
+// declined and should be retried.
+pub struct ExecResult {
+    aborted: bool,
+    replies: Vec<Result<RedisValue, RedisError>>,
+}
+
+impl ExecResult {
+    fn len(self: &Self): i64 {
+        return self.replies.len()
+    }
+
+    fn at(self: &Self, i: i64): Result<RedisValue, RedisError> {
+        if i < 0 || i >= self.replies.len() {
+            return Result.Err(RedisError.client("reply index " + i.toString() + " out of range"))
+        }
+        match self.replies[i] {
+            Result.Ok(v) => {
+                return Result.Ok(v.clone())
+            }
+            Result.Err(e) => {
+                return Result.Err(e.clone())
+            }
+        }
+    }
+
+    // True when any queued command failed at EXEC time. Redis runs the rest of
+    // the transaction anyway — there is no rollback — so this is a report, not
+    // a signal that nothing happened.
+    fn anyFailed(self: &Self): bool {
+        for r in self.replies {
+            match r {
+                Result.Ok(_) => {
+                }
+                Result.Err(_) => {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+}
+
+// ── Pub/sub ──────────────────────────────────────────────────────────────────
+
+// A delivered pub/sub message. `pattern` is empty unless it arrived through a
+// PSUBSCRIBE, in which case it is the pattern that matched.
+pub struct Message {
+    kind: string,
+    pattern: string,
+    channel: string,
+    payload: string,
+}
+
+// ── Connection ───────────────────────────────────────────────────────────────
+
+// An open connection to a Redis server.
+//
+// Not thread-safe and not pooled: one Conn is one socket carrying one
+// request/response conversation at a time.
+pub struct Conn {
+    stream: RespStream,
+    proto: i32,
+    db: i64,
+    open: bool,
+    serverVersion: string,
+    // RESP2 only: the server has put this connection in subscriber mode, where
+    // it will refuse everything except the subscribe commands, PING and QUIT.
+    subscriberMode: bool,
+    subCount: i64,
+    // Push frames that arrived while we were waiting for a command's reply.
+    // Under RESP3 pub/sub deliveries are out-of-band and can interleave with
+    // ordinary traffic, so they are stashed here rather than mistaken for the
+    // reply. `nextMessage` drains this first.
+    pending: Vec<RedisValue>,
+    inMulti: bool,
+}
+
+// Commands Redis still accepts from a RESP2 connection in subscriber mode.
+fn allowedWhileSubscribed(name: &string): bool {
+    let n = name.toUpper()
+    return n == "SUBSCRIBE" || n == "UNSUBSCRIBE" || n == "PSUBSCRIBE"
+    || n == "PUNSUBSCRIBE" || n == "SSUBSCRIBE" || n == "SUNSUBSCRIBE"
+    || n == "PING" || n == "QUIT" || n == "RESET"
+}
+
+fn isSubscriptionEvent(name: &string): bool {
+    return name == "subscribe" || name == "unsubscribe"
+    || name == "psubscribe" || name == "punsubscribe"
+    || name == "ssubscribe" || name == "sunsubscribe"
+}
+
+impl Conn {
+    // Connect, authenticate, negotiate the protocol and select the database.
+    //
+    //   redis://127.0.0.1:6379
+    //   redis://:password@127.0.0.1:6379/2
+    //   redis://user:password@host:6379/0?protocol=2
+    //
+    // Returns only once the connection is usable, not merely once the socket
+    // opened.
+    fn connect(url: &string): Result<Conn, RedisError> {
+        let cfg = parseUrl(url)?
+        return Conn.connectWith(cfg)
+    }
+
+    fn connectWith(cfg: &RedisUrl): Result<Conn, RedisError> {
+        let Result.Ok(ip) = resolve(cfg.host) else {
+            return Result.Err(RedisError.connection("could not resolve host '" + cfg.host + "'"))
+        }
+        let Result.Ok(tcp) = TcpStream.connect(ip, cfg.port) else {
+            return Result.Err(RedisError.connection("could not connect to " + cfg.host + ":" + cfg.port.toString()))
+        }
+        var c = Conn {
+            stream: RespStream.wrap(tcp), proto: 2 as i32, db: 0, open: true,
+            serverVersion: "", subscriberMode: false, subCount: 0,
+            pending: Vec.new(), inMulti: false
+        }
+
+        // AUTH first, then HELLO. The other order looks tempting — `HELLO 3 AUTH
+        // user pass` does both in one round trip — but a server with requirepass
+        // set answers a bare HELLO with NOAUTH, and a server older than 6 has no
+        // HELLO at all, so AUTH-then-HELLO is the one sequence that works
+        // everywhere. Verified against Redis 8.10: see docs/wire-notes.md.
+        if cfg.password.len > 0 {
+            if cfg.username.len > 0 {
+                let _ = c.command(["AUTH", cfg.username.clone(), cfg.password.clone()])?
+            } else {
+                let _ = c.command(["AUTH", cfg.password.clone()])?
+            }
+        }
+
+        if cfg.protocol == 3 as i32 {
+            match c.command(["HELLO", "3"]) {
+                Result.Ok(v) => {
+                    c.proto = 3 as i32
+                    // Bound rather than used inline: an unbound `??` result is
+                    // an owned temporary the compiler does not currently drop
+                    // (leaks one RedisValue per connect).
+                    let version = v.get("version") ?? RedisValue.Nil
+                    c.serverVersion = version.text()
+                }
+                Result.Err(e) => {
+                    // Redis < 6 has no HELLO and answers `ERR unknown command`.
+                    // Anything else (a wrong password reaching us as NOAUTH, say)
+                    // is a real failure and must not be swallowed into a silent
+                    // downgrade.
+                    if e.kind != "ERR" {
+                        c.close()
+                        return Result.Err(e)
+                    }
+                    c.proto = 2 as i32
+                }
+            }
+        }
+        if c.serverVersion.len == 0 {
+            // RESP2, or a HELLO whose map had no version: ask INFO instead.
+            match c.command(["INFO", "server"]) {
+                Result.Ok(v) => {
+                    c.serverVersion = infoField(v.text(), "redis_version")
+                }
+                Result.Err(_) => {
+                }
+            }
+        }
+        if cfg.clientName.len > 0 {
+            let _ = c.command(["CLIENT", "SETNAME", cfg.clientName.clone()])?
+        }
+        if cfg.db != 0 {
+            let _ = c.command(["SELECT", cfg.db.toString()])?
+            c.db = cfg.db
+        }
+        return Result.Ok(c)
+    }
+
+    // Send one command and read one reply, with no subscriber-mode checks. Used
+    // during the handshake, before the Conn is fully built.
+    fn command(self: &mut Self, args: &Vec<string>): Result<RedisValue, RedisError> {
+        self.stream.sendAll(encodeCommand(args))?
+        return self.readReply()
+    }
+
+    // Read the next reply, stashing any out-of-band push frame.
+    //
+    // Under RESP3 a pub/sub delivery can land between a command and its reply.
+    // Treating that push as the reply is exactly how a client starts answering
+    // the previous question, so pushes are queued for `nextMessage` and the read
+    // continues.
+    fn readReply(self: &mut Self): Result<RedisValue, RedisError> {
+        var spins: i64 = 0
+        while spins < 100000 {
+            spins = spins + 1
+            let v = self.stream.readValue()?
+            if self.proto == 3 as i32 {
+                match v {
+                    RedisValue.Push(items) => {
+                        var p = RedisValue.Push(cloneItems(items))
+                        self.notePushCounts(p)
+                        self.pending.push(p)
+                        continue
+                    }
+                    _ => {
+                        return Result.Ok(v)
+                    }
+                }
+            }
+            return Result.Ok(v)
+        }
+        return Result.Err(RedisError.protocol("server sent only push frames"))
+    }
+
+    // Track how many subscriptions the server thinks we hold, from the count in
+    // a subscribe/unsubscribe confirmation. Under RESP2 that number is what says
+    // whether the connection is still stuck in subscriber mode.
+    fn notePushCounts(self: &mut Self, v: &RedisValue): void {
+        let items = v.items()
+        if items.len() < 3 {
+            return
+        }
+        let kind = items[0].text()
+        if !isSubscriptionEvent(kind) {
+            return
+        }
+        self.subCount = items[2].asI64() ?? self.subCount
+        if self.subCount == 0 {
+            self.subscriberMode = false
+        }
+    }
+
+    // Send one command and read its reply.
+    //
+    // `args` is the command and its arguments as separate elements —
+    // `["SET", "k", "v"]`, never `["SET k v"]`. Each one goes on the wire as a
+    // length-prefixed bulk string, so an argument containing spaces, newlines or
+    // NUL bytes stays one argument.
+    fn cmd(self: &mut Self, args: &Vec<string>): Result<RedisValue, RedisError> {
+        self.requireOpen()?
+        if args.len() == 0 {
+            return Result.Err(RedisError.client("cmd() needs at least a command name"))
+        }
+        // The RESP2 asymmetry, refused here rather than on the wire. A RESP2
+        // connection in subscriber mode answers an ordinary command with an
+        // error, but it may also have a message frame queued ahead of that
+        // error — so reading "the reply" would return someone's published
+        // message and leave the error for the next call. Under RESP3 there is no
+        // such mode and ordinary commands work while subscribed.
+        if self.subscriberMode && !allowedWhileSubscribed(args[0]) {
+            return Result.Err(RedisError.client("'" + args[0] + "' is not allowed while this RESP2 connection is in subscriber mode; unsubscribe first, or connect with protocol=3"))
+        }
+        return self.command(args)
+    }
+
+    // Send N commands in one write, then read N replies in order.
+    //
+    // Each reply is its own Result: one command failing (a WRONGTYPE, say) does
+    // not stop the others, because the server already ran them all. A local
+    // failure — the socket dying halfway through — comes back as the outer Err.
+    fn runPipeline(self: &mut Self, p: &Pipeline): Result<Vec<Result<RedisValue, RedisError>>, RedisError> {
+        self.requireOpen()?
+        var out: Vec<Result<RedisValue, RedisError>> = Vec.new()
+        if p.count == 0 {
+            return Result.Ok(out)
+        }
+        // The one write. Everything else in this method is reading.
+        self.stream.sendAll(p.encoded)?
+        for _i in 0..p.count {
+            match self.readReply() {
+                Result.Ok(v) => {
+                    out.push(Result.Ok(v))
+                }
+                Result.Err(e) => {
+                    if e.isLocal() {
+                        return Result.Err(e)
+                    }
+                    out.push(Result.Err(e))
+                }
+            }
+        }
+        return Result.Ok(out)
+    }
+
+    // ── Transactions ─────────────────────────────────────────────────────────
+
+    // Open a transaction. Commands sent after this are queued by the server and
+    // answered `+QUEUED`; nothing runs until `exec()`.
+    fn multi(self: &mut Self): Result<Unit, RedisError> {
+        let _ = self.cmd(["MULTI"])?
+        self.inMulti = true
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // Run the queued commands and collect one reply per command.
+    //
+    // A command that was accepted at queue time can still fail here — INCR on a
+    // string key queues fine and fails at EXEC — so the per-command errors
+    // surface in `replies`, not in the outer Result. Redis does not roll the
+    // rest of the transaction back when one command fails; the others ran.
+    //
+    // The array header is read here rather than through the general parser so
+    // that each element is parsed as a top-level reply, which is what lets an
+    // element's error be its own Result instead of poisoning the whole frame.
+    fn exec(self: &mut Self): Result<ExecResult, RedisError> {
+        self.requireOpen()?
+        self.inMulti = false
+        self.stream.sendAll(encodeCommand(["EXEC"]))?
+        var replies: Vec<Result<RedisValue, RedisError>> = Vec.new()
+
+        // Drain any push frame first, so the tag we read next is really EXEC's.
+        if self.proto == 3 as i32 {
+            let _ = self.peekPast()?
+        }
+        let tag = self.stream.readTag()?
+        if tag == 95 as u8 {
+            // '_' — RESP3 null: aborted by WATCH.
+            let _ = self.stream.readLine()?
+            return Result.Ok(ExecResult {
+                aborted: true, replies: replies
+            }
+            )
+        }
+        if tag == 45 as u8 {
+            // '-' — EXEC itself was refused (no MULTI, or a command failed to
+            // queue and the transaction was discarded).
+            let line = self.stream.readLine()?
+            return Result.Err(RedisError.fromWire(line))
+        }
+        if tag != 42 as u8 {
+            return Result.Err(RedisError.protocol("EXEC answered with reply type byte " + (tag as i64).toString() + ", expected an array"))
+        }
+        let n = self.stream.readCount()?
+        if n < 0 {
+            // '*-1' — RESP2 null: aborted by WATCH.
+            return Result.Ok(ExecResult {
+                aborted: true, replies: replies
+            }
+            )
+        }
+        for _i in 0..n {
+            match self.stream.readValue() {
+                Result.Ok(v) => {
+                    replies.push(Result.Ok(v))
+                }
+                Result.Err(e) => {
+                    if e.isLocal() {
+                        return Result.Err(e)
+                    }
+                    replies.push(Result.Err(e))
+                }
+            }
+        }
+        return Result.Ok(ExecResult {
+            aborted: false, replies: replies
+        }
+        )
+    }
+
+    // Throw the queued commands away. Nothing runs.
+    fn discard(self: &mut Self): Result<Unit, RedisError> {
+        let _ = self.cmd(["DISCARD"])?
+        self.inMulti = false
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    fn inTransaction(self: &Self): bool {
+        return self.inMulti
+    }
+
+    // Stash push frames that are already buffered, without blocking. Used before
+    // reading a reply whose framing we decode by hand.
+    fn peekPast(self: &mut Self): Result<Unit, RedisError> {
+        while self.stream.buffered() > 0 && self.stream.buf[self.stream.pos] == 62 as u8 {
+            let v = self.stream.readValue()?
+            self.notePushCounts(v)
+            self.pending.push(v)
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // ── Pub/sub ──────────────────────────────────────────────────────────────
+
+    // Subscribe to one or more channels.
+    //
+    // The two protocols differ here in a way callers cannot ignore:
+    //
+    //   RESP3 — deliveries arrive as push frames (`>`) that are out of band, so
+    //           this connection can keep running ordinary commands.
+    //   RESP2 — the confirmation and every later message are ordinary arrays,
+    //           and the server puts the connection into "subscriber mode" where
+    //           every other command is refused. `cmd()` refuses them locally to
+    //           keep the reply stream in step; see the comment there.
+    //
+    // Either way, `nextMessage()` is how messages are collected.
+    fn subscribe(self: &mut Self, channels: &Vec<string>): Result<Unit, RedisError> {
+        return self.subscribeWith("SUBSCRIBE", channels)
+    }
+
+    // Subscribe by glob pattern — `news.*` matches `news.sport`.
+    fn psubscribe(self: &mut Self, patterns: &Vec<string>): Result<Unit, RedisError> {
+        return self.subscribeWith("PSUBSCRIBE", patterns)
+    }
+
+    fn unsubscribe(self: &mut Self, channels: &Vec<string>): Result<Unit, RedisError> {
+        return self.subscribeWith("UNSUBSCRIBE", channels)
+    }
+
+    fn punsubscribe(self: &mut Self, patterns: &Vec<string>): Result<Unit, RedisError> {
+        return self.subscribeWith("PUNSUBSCRIBE", patterns)
+    }
+
+    fn subscribeWith(self: &mut Self, verb: &string, names: &Vec<string>): Result<Unit, RedisError> {
+        self.requireOpen()?
+        var args: Vec<string> = Vec.new()
+        args.push(verb.clone())
+        for n in names {
+            args.push(n.clone())
+        }
+        // UNSUBSCRIBE with no names means "all", and the server then answers once
+        // per channel it actually held — a number this client does not know, so
+        // it could not tell where the confirmations end and the next reply
+        // begins. Refusing beats reading the wrong number and desynchronising
+        // the connection; name the channels instead.
+        if names.len() == 0 {
+            return Result.Err(RedisError.client(verb + " with no channels is not supported in v0.1: name the channels to unsubscribe, because the number of confirmations the server sends back is otherwise unknowable"))
+        }
+        let expect = names.len()
+        self.stream.sendAll(encodeCommand(args))?
+        if self.proto == 2 as i32 && (verb == "SUBSCRIBE" || verb == "PSUBSCRIBE") {
+            self.subscriberMode = true
+        }
+        for _i in 0..expect {
+            let v = self.stream.readValue()?
+            let items = v.items()
+            if items.len() < 3 || !isSubscriptionEvent(items[0].text()) {
+                return Result.Err(RedisError.protocol("expected a subscribe confirmation, got " + v.toString()))
+            }
+            self.subCount = items[2].asI64() ?? self.subCount
+        }
+        if self.subCount == 0 {
+            self.subscriberMode = false
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // Wait up to `timeoutMs` for the next published message.
+    //
+    // Ok(None) means the wait expired with nothing delivered — a normal outcome,
+    // not a failure. Confirmations and other non-message frames are consumed and
+    // do not end the wait.
+    fn nextMessage(self: &mut Self, timeoutMs: i64): Result<Option<Message>, RedisError> {
+        self.requireOpen()?
+        var spins: i64 = 0
+        while spins < 1000 {
+            spins = spins + 1
+            // Frames already stashed by a command read come first, in order.
+            if self.pending.len() > 0 {
+                let v = self.pending[0].clone()
+                self.pending.remove(0)
+                match toMessage(v) {
+                    Option.Some(m) => {
+                        return Result.Ok(Option.Some(m))
+                    }
+                    Option.None => {
+                        continue
+                    }
+                }
+            }
+            // A partially buffered frame means the rest is already in flight, so
+            // parsing it will not block for long; an empty buffer means we must
+            // wait on the socket, and that wait is what the timeout bounds.
+            if self.stream.buffered() == 0 {
+                if !waitReadable(self.stream.tcp.rawFd(), Duration.millis(timeoutMs)) {
+                    return Result.Ok(Option.None)
+                }
+            }
+            let v = self.stream.readValue()?
+            self.notePushCounts(v)
+            match toMessage(v) {
+                Option.Some(m) => {
+                    return Result.Ok(Option.Some(m))
+                }
+                Option.None => {
+                }
+            }
+        }
+        return Result.Ok(Option.None)
+    }
+
+    fn isSubscribed(self: &Self): bool {
+        return self.subCount > 0
+    }
+
+    fn subscriptionCount(self: &Self): i64 {
+        return self.subCount
+    }
+
+    // Publish to a channel. Returns the number of subscribers that received it.
+    fn publish(self: &mut Self, channel: &string, payload: &string): Result<i64, RedisError> {
+        let v = self.cmd(["PUBLISH", channel.clone(), payload.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    // ── Connection state ─────────────────────────────────────────────────────
+
+    // 2 or 3 — the protocol that is actually live on this connection, which is
+    // not necessarily the one that was asked for.
+    fn protocol(self: &Self): i32 {
+        return self.proto
+    }
+
+    fn serverVersionText(self: &Self): string {
+        return self.serverVersion.clone()
+    }
+
+    fn database(self: &Self): i64 {
+        return self.db
+    }
+
+    fn isOpen(self: &Self): bool {
+        return self.open
+    }
+
+    // send() calls made on this socket. With `readCount()`, the evidence that a
+    // pipeline is one round trip: N pipelined commands add 1 here, N separate
+    // ones add N.
+    fn writeCount(self: &Self): i64 {
+        return self.stream.writes
+    }
+
+    fn readCount(self: &Self): i64 {
+        return self.stream.reads
+    }
+
+    // Send QUIT and close the socket. Idempotent; using the Conn afterwards is
+    // an error rather than a silent reconnect.
+    fn close(self: &mut Self): void {
+        if self.open {
+            // Best effort: if the peer is already gone there is nothing to
+            // report and nothing a caller could do about it.
+            let _ = self.stream.sendAll(encodeCommand(["QUIT"]))
+            self.open = false
+        }
+        self.stream.shutdown()
+    }
+
+    fn requireOpen(self: &Self): Result<Unit, RedisError> {
+        if !self.open {
+            return Result.Err(RedisError.client("connection is closed"))
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // ── Strings ──────────────────────────────────────────────────────────────
+
+    // GET. None means the key does not exist — distinct from Some("") for a key
+    // holding an empty string.
+    fn get(self: &mut Self, key: &string): Result<Option<string>, RedisError> {
+        let v = self.cmd(["GET", key.clone()])?
+        if v.isNil() {
+            return Result.Ok(Option.None)
+        }
+        return Result.Ok(v.asStr())
+    }
+
+    fn set(self: &mut Self, key: &string, value: &string): Result<Unit, RedisError> {
+        let _ = self.cmd(["SET", key.clone(), value.clone()])?
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // SET with an expiry, in seconds.
+    fn setEx(self: &mut Self, key: &string, seconds: i64, value: &string): Result<Unit, RedisError> {
+        let _ = self.cmd(["SETEX", key.clone(), seconds.toString(), value.clone()])?
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // DEL. Returns how many of the keys existed.
+    fn del(self: &mut Self, keys: &Vec<string>): Result<i64, RedisError> {
+        var args: Vec<string> = Vec.new()
+        args.push("DEL")
+        for k in keys {
+            args.push(k.clone())
+        }
+        let v = self.cmd(args)?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    fn delOne(self: &mut Self, key: &string): Result<i64, RedisError> {
+        let v = self.cmd(["DEL", key.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    fn exists(self: &mut Self, key: &string): Result<bool, RedisError> {
+        let v = self.cmd(["EXISTS", key.clone()])?
+        return Result.Ok((v.asI64() ?? 0) > 0)
+    }
+
+    fn incr(self: &mut Self, key: &string): Result<i64, RedisError> {
+        let v = self.cmd(["INCR", key.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    fn incrBy(self: &mut Self, key: &string, delta: i64): Result<i64, RedisError> {
+        let v = self.cmd(["INCRBY", key.clone(), delta.toString()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    fn decr(self: &mut Self, key: &string): Result<i64, RedisError> {
+        let v = self.cmd(["DECR", key.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    // EXPIRE. False means the key does not exist.
+    fn expire(self: &mut Self, key: &string, seconds: i64): Result<bool, RedisError> {
+        let v = self.cmd(["EXPIRE", key.clone(), seconds.toString()])?
+        return Result.Ok((v.asI64() ?? 0) > 0)
+    }
+
+    // TTL in seconds. -1 means the key has no expiry, -2 that it does not exist;
+    // both are passed through as Redis reports them.
+    fn ttl(self: &mut Self, key: &string): Result<i64, RedisError> {
+        let v = self.cmd(["TTL", key.clone()])?
+        return Result.Ok(v.asI64() ?? -2)
+    }
+
+    // KEYS. O(n) over the whole keyspace and it blocks the server while it runs
+    // — fine for a test or a small database, wrong for a busy production one,
+    // where SCAN is the answer (send it with `cmd`).
+    fn keys(self: &mut Self, pattern: &string): Result<Vec<string>, RedisError> {
+        let v = self.cmd(["KEYS", pattern.clone()])?
+        return Result.Ok(v.asStrings())
+    }
+
+    // ── Hashes ───────────────────────────────────────────────────────────────
+
+    fn hget(self: &mut Self, key: &string, field: &string): Result<Option<string>, RedisError> {
+        let v = self.cmd(["HGET", key.clone(), field.clone()])?
+        if v.isNil() {
+            return Result.Ok(Option.None)
+        }
+        return Result.Ok(v.asStr())
+    }
+
+    // HSET. Returns the number of fields that were newly created.
+    fn hset(self: &mut Self, key: &string, field: &string, value: &string): Result<i64, RedisError> {
+        let v = self.cmd(["HSET", key.clone(), field.clone(), value.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    // HGETALL. RESP2 answers a flat array and RESP3 a map; `asPairs` is why the
+    // caller does not have to know which.
+    fn hgetall(self: &mut Self, key: &string): Result<Vec<Pair>, RedisError> {
+        let v = self.cmd(["HGETALL", key.clone()])?
+        return Result.Ok(v.asPairs())
+    }
+
+    fn hdel(self: &mut Self, key: &string, field: &string): Result<i64, RedisError> {
+        let v = self.cmd(["HDEL", key.clone(), field.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    // ── Lists ────────────────────────────────────────────────────────────────
+
+    fn lpush(self: &mut Self, key: &string, value: &string): Result<i64, RedisError> {
+        let v = self.cmd(["LPUSH", key.clone(), value.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    fn rpush(self: &mut Self, key: &string, value: &string): Result<i64, RedisError> {
+        let v = self.cmd(["RPUSH", key.clone(), value.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    fn lpop(self: &mut Self, key: &string): Result<Option<string>, RedisError> {
+        let v = self.cmd(["LPOP", key.clone()])?
+        if v.isNil() {
+            return Result.Ok(Option.None)
+        }
+        return Result.Ok(v.asStr())
+    }
+
+    fn rpop(self: &mut Self, key: &string): Result<Option<string>, RedisError> {
+        let v = self.cmd(["RPOP", key.clone()])?
+        if v.isNil() {
+            return Result.Ok(Option.None)
+        }
+        return Result.Ok(v.asStr())
+    }
+
+    // LRANGE. Negative indices count from the end: (0, -1) is the whole list.
+    fn lrange(self: &mut Self, key: &string, start: i64, stop: i64): Result<Vec<string>, RedisError> {
+        let v = self.cmd(["LRANGE", key.clone(), start.toString(), stop.toString()])?
+        return Result.Ok(v.asStrings())
+    }
+
+    fn llen(self: &mut Self, key: &string): Result<i64, RedisError> {
+        let v = self.cmd(["LLEN", key.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    // ── Sets ─────────────────────────────────────────────────────────────────
+
+    fn sadd(self: &mut Self, key: &string, member: &string): Result<i64, RedisError> {
+        let v = self.cmd(["SADD", key.clone(), member.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    fn srem(self: &mut Self, key: &string, member: &string): Result<i64, RedisError> {
+        let v = self.cmd(["SREM", key.clone(), member.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    // SMEMBERS. RESP3 answers a set (`~`) and RESP2 an array (`*`); both come
+    // back as the same Vec here. Redis does not order set members — do not
+    // depend on the order this returns.
+    fn smembers(self: &mut Self, key: &string): Result<Vec<string>, RedisError> {
+        let v = self.cmd(["SMEMBERS", key.clone()])?
+        return Result.Ok(v.asStrings())
+    }
+
+    fn sismember(self: &mut Self, key: &string, member: &string): Result<bool, RedisError> {
+        let v = self.cmd(["SISMEMBER", key.clone(), member.clone()])?
+        return Result.Ok((v.asI64() ?? 0) > 0)
+    }
+
+    // ── Sorted sets ──────────────────────────────────────────────────────────
+
+    fn zadd(self: &mut Self, key: &string, score: f64, member: &string): Result<i64, RedisError> {
+        let v = self.cmd(["ZADD", key.clone(), score.toString(), member.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    // ZRANGE by rank, low score first. (0, -1) is the whole set.
+    fn zrange(self: &mut Self, key: &string, start: i64, stop: i64): Result<Vec<string>, RedisError> {
+        let v = self.cmd(["ZRANGE", key.clone(), start.toString(), stop.toString()])?
+        return Result.Ok(v.asStrings())
+    }
+
+    // ZSCORE. The reply type differs by protocol — RESP2 sends the bulk string
+    // "1.5", RESP3 sends the double `,1.5` — and `asF64` accepts both, so this
+    // returns the same f64 either way.
+    fn zscore(self: &mut Self, key: &string, member: &string): Result<Option<f64>, RedisError> {
+        let v = self.cmd(["ZSCORE", key.clone(), member.clone()])?
+        if v.isNil() {
+            return Result.Ok(Option.None)
+        }
+        return Result.Ok(v.asF64())
+    }
+
+    fn zrem(self: &mut Self, key: &string, member: &string): Result<i64, RedisError> {
+        let v = self.cmd(["ZREM", key.clone(), member.clone()])?
+        return Result.Ok(v.asI64() ?? 0)
+    }
+
+    // ── Server ───────────────────────────────────────────────────────────────
+
+    // PING. One command, two reply shapes: `+PONG` normally, but a RESP2
+    // connection in subscriber mode answers the array `["pong", ""]` instead.
+    // Both come back as "PONG" here so a caller's health check does not have to
+    // know which mode the connection is in.
+    fn ping(self: &mut Self): Result<string, RedisError> {
+        let v = self.cmd(["PING"])?
+        let items = v.items()
+        if items.len() == 2 && items[0].text() == "pong" {
+            return Result.Ok("PONG")
+        }
+        return Result.Ok(v.text())
+    }
+
+    // Empty the current database. Destructive, and exactly what a test wants
+    // between cases.
+    fn flushdb(self: &mut Self): Result<Unit, RedisError> {
+        let _ = self.cmd(["FLUSHDB"])?
+        return Result.Ok(Unit {
+        }
+        )
+    }
+}
+
+// A push frame that is really a delivery, turned into a Message. Confirmations
+// and anything else give None.
+fn toMessage(v: &RedisValue): Option<Message> {
+    let items = v.items()
+    if items.len() < 3 {
+        return Option.None
+    }
+    let kind = items[0].text()
+    if kind == "message" {
+        return Option.Some(Message {
+            kind: kind, pattern: "", channel: items[1].text(), payload: items[2].text()
+        }
+        )
+    }
+    if kind == "pmessage" && items.len() >= 4 {
+        return Option.Some(Message {
+            kind: kind, pattern: items[1].text(), channel: items[2].text(), payload: items[3].text()
+        }
+        )
+    }
+    return Option.None
+}
+
+// Pull one field out of an INFO section: `redis_version:8.10.0` on its own line.
+fn infoField(info: &string, name: &string): string {
+    for line in info.lines() {
+        if line.startsWith(name) && line.len > name.len && line[name.len] == 58 as u8 {
+            return line.substr(name.len + 1, line.len).trim()
+        }
+    }
+    return ""
+}

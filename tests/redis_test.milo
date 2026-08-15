@@ -1,0 +1,1044 @@
+// Integration tests for the Redis client. They need a real server: start one
+// with `sh scripts/test-server.sh start`, or run the whole gate with
+// `sh scripts/run-tests.sh`.
+//
+// The harness sets `requirepass` on purpose. A stock redis-server accepts
+// unauthenticated connections, and under that the client's AUTH path never
+// executes — this suite would be green with the handshake entirely unexercised.
+// testNoAuthRejected is the negative control that proves auth is really on.
+//
+// `milo test` runs every test in its own process, so each one opens its own
+// connection. Keys are prefixed per test rather than cleared with FLUSHDB:
+// a shared FLUSHDB would race any test that ran alongside it.
+from "../lib" import {
+    Conn, Pipeline, RedisValue, RedisError, RedisUrl, Pair, Message, parseUrl, encodeCommand
+}
+from "std/env" import {
+    Env
+}
+from "std/testing" import {
+    assertTrue, assertFalse, assertEqual64, assertStrEqual, assertContains, assertMsg, assertNear
+}
+
+fn url(): string {
+    return Env.getOr("MILO_REDIS_URL", "redis://:testpw@127.0.0.1:56379/0")
+}
+
+// The same server, forced down to RESP2. Every "does the protocol matter"
+// assertion in this file is a differential against this.
+fn url2(): string {
+    return url() + "?protocol=2"
+}
+
+// The harness URL with the password removed, for the negative control.
+fn urlNoAuth(): string {
+    let u = parseUrl(url())!
+    return "redis://" + u.host + ":" + u.port.toString()
+}
+
+fn conn(): Conn {
+    match Conn.connect(url()) {
+        Result.Ok(c) => {
+            return c
+        }
+        Result.Err(e) => {
+            assertMsg(false, "connect failed: " + e.toString())
+            // Unreachable: assertMsg(false) exits. The return keeps the function
+            // total for the type checker.
+            return Conn.connect(url())!
+        }
+    }
+}
+
+fn openResp2(): Conn {
+    match Conn.connect(url2()) {
+        Result.Ok(c) => {
+            return c
+        }
+        Result.Err(e) => {
+            assertMsg(false, "RESP2 connect failed: " + e.toString())
+            return Conn.connect(url2())!
+        }
+    }
+}
+
+// ── Authentication ───────────────────────────────────────────────────────────
+
+fn testConnectWithAuth(): void {
+    var c = conn()
+    assertTrue(c.isOpen())
+    assertStrEqual(c.ping()!, "PONG")
+    assertTrue(c.serverVersionText().len > 0)
+    c.close()
+    assertFalse(c.isOpen())
+    // Using a closed connection is an error, not a silent reconnect.
+    match c.ping() {
+        Result.Ok(_) => {
+            assertMsg(false, "a closed connection answered a command")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "CLIENT")
+        }
+    }
+}
+
+// THE NEGATIVE CONTROL. Without it, an AUTH path that never ran — or one that
+// ignored the server's answer — would pass every other test in this file.
+fn testNoAuthRejected(): void {
+    match Conn.connect(urlNoAuth()) {
+        Result.Ok(_) => {
+            assertMsg(false, "the server accepted an unauthenticated connection: requirepass is not set, so nothing here tests AUTH")
+        }
+        Result.Err(e) => {
+            // The prefix is what a caller branches on, and it is the prefix that
+            // says "you did not authenticate" rather than "that command failed".
+            assertStrEqual(e.kind, "NOAUTH")
+            assertTrue(e.isServer())
+        }
+    }
+}
+
+fn testWrongPasswordRejected(): void {
+    let u = parseUrl(url())!
+    match Conn.connect("redis://:definitelynotthepassword@" + u.host + ":" + u.port.toString()) {
+        Result.Ok(_) => {
+            assertMsg(false, "a wrong password was accepted")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "WRONGPASS")
+        }
+    }
+}
+
+// ── Protocol negotiation ─────────────────────────────────────────────────────
+
+// HELLO 3 really succeeded — not "was sent and ignored".
+fn testHello3Negotiated(): void {
+    var c = conn()
+    assertEqual64(c.protocol() as i64, 3)
+    // The version came out of HELLO's map, which means the map — including its
+    // nested `modules` array of maps — parsed.
+    assertTrue(c.serverVersionText().len > 0)
+    let hello = c.cmd(["HELLO", "3"])!
+    assertStrEqual(hello.typeName(), "map")
+    assertEqual64((hello.get("proto") ?? RedisValue.Nil).asI64() ?? 0, 3)
+    c.close()
+}
+
+fn testResp2Requested(): void {
+    var c = openResp2()
+    assertEqual64(c.protocol() as i64, 2)
+    assertTrue(c.serverVersionText().len > 0)
+    c.close()
+}
+
+// The reply TYPE for one identical command differs by protocol. This is the
+// hazard the whole client is shaped around, asserted directly.
+fn testConfigGetTypeDiffersByProtocol(): void {
+    var c3 = conn()
+    let v3 = c3.cmd(["CONFIG", "GET", "maxmemory"])!
+    assertStrEqual(v3.typeName(), "map")
+    c3.close()
+
+    var c2 = openResp2()
+    let v2 = c2.cmd(["CONFIG", "GET", "maxmemory"])!
+    assertStrEqual(v2.typeName(), "array")
+    c2.close()
+}
+
+// …and asPairs() is the normalisation that makes the difference invisible to a
+// caller who does not care.
+fn testAsPairsSameUnderBothProtocols(): void {
+    var c3 = conn()
+    let p3 = c3.cmd(["CONFIG", "GET", "maxmemory"])!.asPairs()
+    c3.close()
+
+    var c2 = openResp2()
+    let p2 = c2.cmd(["CONFIG", "GET", "maxmemory"])!.asPairs()
+    c2.close()
+
+    assertEqual64(p3.len(), 1)
+    assertEqual64(p2.len(), p3.len())
+    assertStrEqual(p3[0].key, "maxmemory")
+    assertStrEqual(p2[0].key, p3[0].key)
+    assertStrEqual(p2[0].text(), p3[0].text())
+}
+
+// ── Value types ──────────────────────────────────────────────────────────────
+
+// $-1 (no such key) and $0 (a key holding an empty string) are different
+// answers. A client that conflates them reports a missing key as "".
+fn testNullBulkIsNotEmptyString(): void {
+    var c = conn()
+    let missing = "t:null:absent"
+    let empty = "t:null:empty"
+    let _ = c.delOne(missing)!
+    c.set(empty, "")!
+
+    let rawMissing = c.cmd(["GET", missing.clone()])!
+    assertStrEqual(rawMissing.typeName(), "nil")
+    assertTrue(rawMissing.isNil())
+
+    let rawEmpty = c.cmd(["GET", empty.clone()])!
+    assertStrEqual(rawEmpty.typeName(), "string")
+    assertFalse(rawEmpty.isNil())
+    assertEqual64((rawEmpty.asStr() ?? "x").len, 0)
+
+    // …and the typed helper preserves the distinction.
+    assertTrue(c.get(missing)!.isNone())
+    match c.get(empty)! {
+        Option.Some(s) => {
+            assertEqual64(s.len, 0)
+        }
+        Option.None => {
+            assertMsg(false, "an empty string came back as a missing key")
+        }
+    }
+    let _ = c.delOne(empty)!
+    c.close()
+}
+
+// Under RESP2 the same null is spelled `$-1` on the wire instead of `_`; both
+// have to land on Nil.
+fn testNullBulkUnderResp2(): void {
+    var c = openResp2()
+    let _ = c.delOne("t:null2:absent")!
+    assertTrue(c.cmd(["GET", "t:null2:absent"])!.isNil())
+    assertTrue(c.get("t:null2:absent")!.isNone())
+    // RESP2's null ARRAY, a different wire spelling again (`*-1`).
+    let noScore = c.cmd(["ZSCORE", "t:null2:absent", "member"])!
+    assertTrue(noScore.isNil())
+    c.close()
+}
+
+fn testScalarTypes(): void {
+    var c = conn()
+    // Simple string `+OK` / `+PONG`.
+    assertStrEqual(c.cmd(["PING"])!.typeName(), "string")
+    assertStrEqual(c.cmd(["PING"])!.text(), "PONG")
+    // Bulk string `$`.
+    c.set("t:types:s", "hello")!
+    assertStrEqual(c.cmd(["GET", "t:types:s"])!.typeName(), "string")
+    // Integer `:`.
+    let _ = c.delOne("t:types:n")!
+    let n = c.cmd(["INCR", "t:types:n"])!
+    assertStrEqual(n.typeName(), "integer")
+    assertEqual64(n.asI64() ?? 0, 1)
+    let _ = c.del(["t:types:s", "t:types:n"])!
+    c.close()
+}
+
+fn testAggregateTypes(): void {
+    var c = conn()
+    let list = "t:agg:list"
+    let set = "t:agg:set"
+    let hash = "t:agg:hash"
+    let zset = "t:agg:zset"
+    let _ = c.del([list.clone(), set.clone(), hash.clone(), zset.clone()])!
+
+    let _ = c.rpush(list, "a")!
+    let _ = c.rpush(list, "b")!
+    // Arrays are `*` in both protocols.
+    assertStrEqual(c.cmd(["LRANGE", list.clone(), "0", "-1"])!.typeName(), "array")
+
+    let _ = c.sadd(set, "x")!
+    // RESP3 sends a set `~` where RESP2 sends an array.
+    assertStrEqual(c.cmd(["SMEMBERS", set.clone()])!.typeName(), "set")
+
+    let _ = c.hset(hash, "f", "v")!
+    assertStrEqual(c.cmd(["HGETALL", hash.clone()])!.typeName(), "map")
+
+    let _ = c.zadd(zset, 1.5, "m")!
+    // RESP3 sends a double `,` where RESP2 sends a bulk string.
+    let score = c.cmd(["ZSCORE", zset.clone(), "m"])!
+    assertStrEqual(score.typeName(), "double")
+    assertNear(score.asF64() ?? 0.0, 1.5, 0.000001)
+
+    let _ = c.del([list.clone(), set.clone(), hash.clone(), zset.clone()])!
+    c.close()
+}
+
+// The same four commands under RESP2: different wire types, same values out.
+fn testAggregateTypesUnderResp2(): void {
+    var c = openResp2()
+    let set = "t:agg2:set"
+    let hash = "t:agg2:hash"
+    let zset = "t:agg2:zset"
+    let _ = c.del([set.clone(), hash.clone(), zset.clone()])!
+
+    let _ = c.sadd(set, "x")!
+    assertStrEqual(c.cmd(["SMEMBERS", set.clone()])!.typeName(), "array")
+    assertEqual64(c.smembers(set)!.len(), 1)
+
+    let _ = c.hset(hash, "f", "v")!
+    assertStrEqual(c.cmd(["HGETALL", hash.clone()])!.typeName(), "array")
+    let pairs = c.hgetall(hash)!
+    assertEqual64(pairs.len(), 1)
+    assertStrEqual(pairs[0].key, "f")
+    assertStrEqual(pairs[0].text(), "v")
+
+    let _ = c.zadd(zset, 1.5, "m")!
+    assertStrEqual(c.cmd(["ZSCORE", zset.clone(), "m"])!.typeName(), "string")
+    assertNear(c.zscore(zset, "m")! ?? 0.0, 1.5, 0.000001)
+
+    let _ = c.del([set.clone(), hash.clone(), zset.clone()])!
+    c.close()
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+// The prefix is what callers branch on, so it has to survive decoding.
+fn testWrongTypeError(): void {
+    var c = conn()
+    let key = "t:err:list"
+    let _ = c.delOne(key)!
+    let _ = c.rpush(key, "a")!
+    match c.incr(key) {
+        Result.Ok(_) => {
+            assertMsg(false, "INCR on a list key was accepted")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "WRONGTYPE")
+            assertContains(e.message, "wrong kind of value")
+            assertTrue(e.isServer())
+        }
+    }
+    let _ = c.delOne(key)!
+    c.close()
+}
+
+fn testErrPrefixOnBadValue(): void {
+    var c = conn()
+    let key = "t:err:str"
+    c.set(key, "not a number")!
+    match c.incr(key) {
+        Result.Ok(_) => {
+            assertMsg(false, "INCR on a non-numeric string was accepted")
+        }
+        Result.Err(e) => {
+            // Not WRONGTYPE: the key IS a string, which INCR accepts — it is the
+            // value that is not an integer. Redis reports the two differently and
+            // so does this client.
+            assertStrEqual(e.kind, "ERR")
+        }
+    }
+    let _ = c.delOne(key)!
+    c.close()
+}
+
+fn testUnknownCommandError(): void {
+    var c = conn()
+    match c.cmd(["NOSUCHCOMMAND", "arg"]) {
+        Result.Ok(_) => {
+            assertMsg(false, "an unknown command succeeded")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "ERR")
+        }
+    }
+    // The connection is still usable: an error reply is a complete frame, not a
+    // desync.
+    assertStrEqual(c.ping()!, "PONG")
+    c.close()
+}
+
+// ── Typed helpers ────────────────────────────────────────────────────────────
+
+fn testStringHelpers(): void {
+    var c = conn()
+    let key = "t:str:key"
+    let _ = c.delOne(key)!
+    assertFalse(c.exists(key)!)
+    c.set(key, "value")!
+    assertTrue(c.exists(key)!)
+    assertStrEqual(c.get(key)! ?? "", "value")
+
+    let counter = "t:str:counter"
+    let _ = c.delOne(counter)!
+    assertEqual64(c.incr(counter)!, 1)
+    assertEqual64(c.incrBy(counter, 10)!, 11)
+    assertEqual64(c.decr(counter)!, 10)
+
+    // TTL: -1 = no expiry, -2 = no such key.
+    assertEqual64(c.ttl(key)!, -1)
+    assertTrue(c.expire(key, 100)!)
+    let ttl = c.ttl(key)!
+    assertTrue(ttl > 90 && ttl <= 100)
+    assertFalse(c.expire("t:str:missing", 100)!)
+    assertEqual64(c.ttl("t:str:missing")!, -2)
+
+    let sess = "t:str:session"
+    c.setEx(sess, 60, "token")!
+    assertStrEqual(c.get(sess)! ?? "", "token")
+    assertTrue(c.ttl(sess)! > 50)
+
+    assertEqual64(c.del([key.clone(), counter.clone(), sess.clone()])!, 3)
+    c.close()
+}
+
+fn testKeysPattern(): void {
+    var c = conn()
+    let a = "t:keys:alpha"
+    let b = "t:keys:beta"
+    let _ = c.del([a.clone(), b.clone()])!
+    c.set(a, "1")!
+    c.set(b, "2")!
+    let found = c.keys("t:keys:*")!
+    assertEqual64(found.len(), 2)
+    let _ = c.del([a.clone(), b.clone()])!
+    c.close()
+}
+
+fn testHashHelpers(): void {
+    var c = conn()
+    let key = "t:hash:user"
+    let _ = c.delOne(key)!
+    assertEqual64(c.hset(key, "name", "ada")!, 1)
+    assertEqual64(c.hset(key, "role", "engineer")!, 1)
+    // Setting an existing field creates nothing new.
+    assertEqual64(c.hset(key, "name", "ada")!, 0)
+    assertStrEqual(c.hget(key, "name")! ?? "", "ada")
+    assertTrue(c.hget(key, "nope")!.isNone())
+
+    var sawName = false
+    var sawRole = false
+    for p in c.hgetall(key)! {
+        if p.key == "name" && p.text() == "ada" {
+            sawName = true
+        }
+        if p.key == "role" && p.text() == "engineer" {
+            sawRole = true
+        }
+    }
+    assertTrue(sawName)
+    assertTrue(sawRole)
+
+    assertEqual64(c.hdel(key, "role")!, 1)
+    assertEqual64(c.hgetall(key)!.len(), 1)
+    let _ = c.delOne(key)!
+    c.close()
+}
+
+fn testListHelpers(): void {
+    var c = conn()
+    let key = "t:list:queue"
+    let _ = c.delOne(key)!
+    assertEqual64(c.rpush(key, "b")!, 1)
+    assertEqual64(c.rpush(key, "c")!, 2)
+    assertEqual64(c.lpush(key, "a")!, 3)
+    assertEqual64(c.llen(key)!, 3)
+
+    let all = c.lrange(key, 0, -1)!
+    assertEqual64(all.len(), 3)
+    assertStrEqual(all[0], "a")
+    assertStrEqual(all[1], "b")
+    assertStrEqual(all[2], "c")
+
+    assertStrEqual(c.lpop(key)! ?? "", "a")
+    assertStrEqual(c.rpop(key)! ?? "", "c")
+    assertEqual64(c.llen(key)!, 1)
+    let _ = c.delOne(key)!
+    // Popping an empty list is a null, not an error, and not "".
+    assertTrue(c.lpop(key)!.isNone())
+    assertTrue(c.rpop(key)!.isNone())
+    c.close()
+}
+
+fn testSetHelpers(): void {
+    var c = conn()
+    let key = "t:set:tags"
+    let _ = c.delOne(key)!
+    assertEqual64(c.sadd(key, "x")!, 1)
+    assertEqual64(c.sadd(key, "y")!, 1)
+    assertEqual64(c.sadd(key, "x")!, 0)
+    assertTrue(c.sismember(key, "x")!)
+    assertFalse(c.sismember(key, "z")!)
+    // Redis does not order set members; only the count is safe to assert.
+    assertEqual64(c.smembers(key)!.len(), 2)
+    assertEqual64(c.srem(key, "x")!, 1)
+    assertEqual64(c.smembers(key)!.len(), 1)
+    let _ = c.delOne(key)!
+    c.close()
+}
+
+fn testSortedSetHelpers(): void {
+    var c = conn()
+    let key = "t:zset:scores"
+    let _ = c.delOne(key)!
+    assertEqual64(c.zadd(key, 99.5, "ada")!, 1)
+    assertEqual64(c.zadd(key, 88.25, "grace")!, 1)
+    let ranked = c.zrange(key, 0, -1)!
+    assertEqual64(ranked.len(), 2)
+    // ZRANGE is by rank, low score first.
+    assertStrEqual(ranked[0], "grace")
+    assertStrEqual(ranked[1], "ada")
+    assertNear(c.zscore(key, "ada")! ?? 0.0, 99.5, 0.000001)
+    assertTrue(c.zscore(key, "nobody")!.isNone())
+    assertEqual64(c.zrem(key, "grace")!, 1)
+    assertEqual64(c.zrange(key, 0, -1)!.len(), 1)
+    let _ = c.delOne(key)!
+    c.close()
+}
+
+// ── Binary safety ────────────────────────────────────────────────────────────
+
+// RESP bulk strings are length-prefixed, so a value is never scanned for a
+// terminator. NUL bytes, CRLF and bytes that are not valid UTF-8 all have to
+// survive the round trip byte for byte, in the key as well as the value.
+fn testBinarySafeValues(): void {
+    var c = conn()
+    var key: string = "t:bin:"
+    key.push(0 as u8)
+    key.push(255 as u8)
+
+    var value: string = ""
+    value.push(0 as u8)
+    value.pushStr("after-nul")
+    value.push(255 as u8)
+    value.push(254 as u8)
+    value.pushStr("\r\n$3\r\nfake")
+    value.push(0 as u8)
+    value.push(10 as u8)
+    let want = value.len
+
+    c.set(key, value)!
+    let got = c.get(key)! ?? ""
+    assertEqual64(got.len, want)
+    var same = true
+    for i in 0..want {
+        if got[i] != value[i] {
+            same = false
+        }
+    }
+    assertMsg(same, "a binary value did not round-trip byte for byte")
+    // The embedded `\r\n$3\r\nfake` did not desynchronise the reader: the next
+    // command still answers its own reply.
+    assertStrEqual(c.ping()!, "PONG")
+    assertEqual64(c.delOne(key)!, 1)
+    c.close()
+}
+
+// ── Pipelining ───────────────────────────────────────────────────────────────
+
+// N commands, N replies, in order — and one round trip, proved by the socket
+// counters rather than by a timing measurement that would be flaky.
+fn testPipelineIsOneRoundTrip(): void {
+    var c = conn()
+    let key = "t:pipe:list"
+    let _ = c.delOne(key)!
+
+    var p = Pipeline.new()
+    for i in 0..20 {
+        p.add(["RPUSH", key.clone(), i.toString()])
+    }
+    assertEqual64(p.len(), 20)
+
+    let writesBefore = c.writeCount()
+    let readsBefore = c.readCount()
+    let replies = c.runPipeline(p)!
+    let writes = c.writeCount() - writesBefore
+    let reads = c.readCount() - readsBefore
+
+    assertEqual64(replies.len(), 20)
+    // ONE write for twenty commands. This is the whole point of a pipeline.
+    assertEqual64(writes, 1)
+    assertMsg(reads < 20, "pipelined replies took " + reads.toString() + " reads; a pipeline should not read once per command")
+
+    // In order: RPUSH answers the new length, so reply i must be i+1.
+    for i in 0..20 {
+        match replies[i] {
+            Result.Ok(v) => {
+                assertEqual64(v.asI64() ?? -1, i + 1)
+            }
+            Result.Err(e) => {
+                assertMsg(false, "pipelined reply " + i.toString() + " failed: " + e.toString())
+            }
+        }
+    }
+
+    // The contrast that makes the number mean something: the same twenty
+    // commands sent one at a time cost twenty writes.
+    let soloBefore = c.writeCount()
+    for i in 0..20 {
+        let _ = c.rpush(key, i.toString())!
+    }
+    assertEqual64(c.writeCount() - soloBefore, 20)
+
+    let _ = c.delOne(key)!
+    c.close()
+}
+
+// One command failing inside a pipeline does not stop the others, and does not
+// shift the replies: each keeps its own slot.
+fn testPipelineKeepsPerCommandErrors(): void {
+    var c = conn()
+    let str = "t:pipe:str"
+    c.set(str, "text")!
+
+    var p = Pipeline.new()
+    p.add(["PING"])
+    p.add(["LPUSH", str.clone(), "x"])
+    p.add(["PING"])
+    let replies = c.runPipeline(p)!
+    assertEqual64(replies.len(), 3)
+    match replies[0] {
+        Result.Ok(v) => {
+            assertStrEqual(v.text(), "PONG")
+        }
+        Result.Err(e) => {
+            assertMsg(false, "first pipelined PING failed: " + e.toString())
+        }
+    }
+    match replies[1] {
+        Result.Ok(_) => {
+            assertMsg(false, "LPUSH on a string key was accepted")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "WRONGTYPE")
+        }
+    }
+    match replies[2] {
+        Result.Ok(v) => {
+            assertStrEqual(v.text(), "PONG")
+        }
+        Result.Err(e) => {
+            assertMsg(false, "third pipelined PING failed: " + e.toString())
+        }
+    }
+    let _ = c.delOne(str)!
+    c.close()
+}
+
+fn testEmptyPipeline(): void {
+    var c = conn()
+    var p = Pipeline.new()
+    assertTrue(p.isEmpty())
+    let writesBefore = c.writeCount()
+    assertEqual64(c.runPipeline(p)!.len(), 0)
+    // Nothing queued means nothing written — not an empty array on the wire.
+    assertEqual64(c.writeCount() - writesBefore, 0)
+    c.close()
+}
+
+// ── Transactions ─────────────────────────────────────────────────────────────
+
+fn testMultiExecCommits(): void {
+    var c = conn()
+    let key = "t:tx:commit"
+    let counter = "t:tx:counter"
+    let _ = c.del([key.clone(), counter.clone()])!
+
+    c.multi()!
+    assertTrue(c.inTransaction())
+    // Inside MULTI the server answers +QUEUED, not the command's own reply.
+    assertStrEqual(c.cmd(["SET", key.clone(), "committed"])!.text(), "QUEUED")
+    assertStrEqual(c.cmd(["INCR", counter.clone()])!.text(), "QUEUED")
+    // …so nothing has happened yet.
+
+    let res = c.exec()!
+    assertFalse(c.inTransaction())
+    assertFalse(res.aborted)
+    assertEqual64(res.len(), 2)
+    assertFalse(res.anyFailed())
+    assertStrEqual(c.get(key)! ?? "", "committed")
+    assertEqual64(c.cmd(["GET", counter.clone()])!.asI64() ?? 0, 1)
+    let _ = c.del([key.clone(), counter.clone()])!
+    c.close()
+}
+
+fn testDiscardDoesNotCommit(): void {
+    var c = conn()
+    let key = "t:tx:discard"
+    let _ = c.delOne(key)!
+    c.set(key, "original")!
+
+    c.multi()!
+    assertStrEqual(c.cmd(["SET", key.clone(), "changed"])!.text(), "QUEUED")
+    c.discard()!
+    assertFalse(c.inTransaction())
+    assertStrEqual(c.get(key)! ?? "", "original")
+
+    // EXEC after DISCARD is an error, which proves DISCARD really closed the
+    // transaction rather than the client just forgetting about it.
+    match c.exec() {
+        Result.Ok(_) => {
+            assertMsg(false, "EXEC succeeded after DISCARD")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "ERR")
+            assertContains(e.message, "without MULTI")
+        }
+    }
+    let _ = c.delOne(key)!
+    c.close()
+}
+
+// A command that queues cleanly can still fail when EXEC runs it — and Redis
+// does not roll the rest back. Both halves of that are asserted here, because a
+// client that reported the whole transaction as failed would be lying about the
+// commands that did run.
+fn testQueuedCommandErrorSurfacesAtExec(): void {
+    var c = conn()
+    let list = "t:tx:list"
+    let ok = "t:tx:ok"
+    let _ = c.del([list.clone(), ok.clone()])!
+    let _ = c.rpush(list, "a")!
+
+    c.multi()!
+    // The server accepts this at queue time: it checks arity, not types.
+    assertStrEqual(c.cmd(["INCR", list.clone()])!.text(), "QUEUED")
+    assertStrEqual(c.cmd(["SET", ok.clone(), "ran"])!.text(), "QUEUED")
+
+    let res = c.exec()!
+    assertFalse(res.aborted)
+    assertEqual64(res.len(), 2)
+    assertTrue(res.anyFailed())
+    match res.at(0) {
+        Result.Ok(_) => {
+            assertMsg(false, "INCR on a list succeeded inside a transaction")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "WRONGTYPE")
+        }
+    }
+    match res.at(1) {
+        Result.Ok(v) => {
+            assertStrEqual(v.text(), "OK")
+        }
+        Result.Err(e) => {
+            assertMsg(false, "the second command should still have run: " + e.toString())
+        }
+    }
+    // Redis has no rollback: the command after the failure really did take effect.
+    assertStrEqual(c.get(ok)! ?? "", "ran")
+    let _ = c.del([list.clone(), ok.clone()])!
+    c.close()
+}
+
+// A command that cannot even be queued (wrong arity) aborts the whole
+// transaction: EXEC then refuses rather than running a truncated batch.
+fn testQueueTimeErrorAbortsTransaction(): void {
+    var c = conn()
+    let key = "t:tx:abort"
+    let _ = c.delOne(key)!
+    c.multi()!
+    assertStrEqual(c.cmd(["SET", key.clone(), "queued"])!.text(), "QUEUED")
+    match c.cmd(["GET"]) {
+        Result.Ok(_) => {
+            assertMsg(false, "GET with no arguments queued successfully")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "ERR")
+        }
+    }
+    match c.exec() {
+        Result.Ok(_) => {
+            assertMsg(false, "EXEC ran a transaction that had a queue-time error")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "EXECABORT")
+        }
+    }
+    assertTrue(c.get(key)!.isNone())
+    c.close()
+}
+
+// ── Pub/sub ──────────────────────────────────────────────────────────────────
+
+// RESP3: deliveries are push frames, out of band from command replies.
+fn testPubSubResp3(): void {
+    var sub = conn()
+    var writer = conn()
+    let channel = "t:pubsub:resp3"
+
+    sub.subscribe([channel.clone()])!
+    assertTrue(sub.isSubscribed())
+    assertEqual64(sub.subscriptionCount(), 1)
+
+    assertEqual64(writer.publish(channel, "hello")!, 1)
+    match sub.nextMessage(3000)! {
+        Option.Some(m) => {
+            assertStrEqual(m.kind, "message")
+            assertStrEqual(m.channel, channel)
+            assertStrEqual(m.payload, "hello")
+        }
+        Option.None => {
+            assertMsg(false, "no message arrived within 3s")
+        }
+    }
+
+    // THE RESP3 HALF OF THE ASYMMETRY: a subscribed RESP3 connection can still
+    // run ordinary commands, because pushes are out of band.
+    assertStrEqual(sub.ping()!, "PONG")
+    assertStrEqual(sub.cmd(["ECHO", "still working"])!.text(), "still working")
+
+    sub.unsubscribe([channel.clone()])!
+    assertFalse(sub.isSubscribed())
+    writer.close()
+    sub.close()
+}
+
+// A push that lands while a command reply is outstanding must not be mistaken
+// for that reply — the classic way a client starts answering the previous
+// question.
+fn testPushDoesNotStealCommandReply(): void {
+    var sub = conn()
+    var writer = conn()
+    let channel = "t:pubsub:interleave"
+    sub.subscribe([channel.clone()])!
+    assertEqual64(writer.publish(channel, "out of band")!, 1)
+
+    // The push is now in flight. This ECHO must answer ECHO.
+    assertStrEqual(sub.cmd(["ECHO", "mine"])!.text(), "mine")
+    // …and the push was kept, not dropped.
+    match sub.nextMessage(3000)! {
+        Option.Some(m) => {
+            assertStrEqual(m.payload, "out of band")
+        }
+        Option.None => {
+            assertMsg(false, "the push frame was lost while reading a command reply")
+        }
+    }
+    writer.close()
+    sub.close()
+}
+
+// RESP2: the server puts the connection into subscriber mode, where ordinary
+// commands are refused. This client refuses them locally instead of writing
+// them, because a queued message frame would otherwise be read as the reply.
+fn testPubSubResp2SubscriberMode(): void {
+    var sub = openResp2()
+    var writer = conn()
+    let channel = "t:pubsub:resp2"
+
+    sub.subscribe([channel.clone()])!
+    assertTrue(sub.isSubscribed())
+
+    match sub.cmd(["GET", "anything"]) {
+        Result.Ok(_) => {
+            assertMsg(false, "an ordinary command ran on a RESP2 connection in subscriber mode")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "CLIENT")
+            assertContains(e.message, "subscriber mode")
+        }
+    }
+    // PING stays legal even in subscriber mode — and answers the array
+    // ["pong", ""] there rather than +PONG, which ping() normalises away.
+    assertStrEqual(sub.cmd(["PING"])!.typeName(), "array")
+    assertStrEqual(sub.ping()!, "PONG")
+
+    // A bare UNSUBSCRIBE is refused rather than desynchronising the connection:
+    // the server answers once per channel it holds, a count this client cannot
+    // know.
+    var none: Vec<string> = Vec.new()
+    match sub.unsubscribe(none) {
+        Result.Ok(_) => {
+            assertMsg(false, "UNSUBSCRIBE with no channels was accepted")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "CLIENT")
+        }
+    }
+
+    assertEqual64(writer.publish(channel, "resp2 payload")!, 1)
+    match sub.nextMessage(3000)! {
+        Option.Some(m) => {
+            assertStrEqual(m.channel, channel)
+            assertStrEqual(m.payload, "resp2 payload")
+        }
+        Option.None => {
+            assertMsg(false, "no RESP2 message arrived within 3s")
+        }
+    }
+
+    // Leaving subscriber mode makes ordinary commands legal again.
+    sub.unsubscribe([channel.clone()])!
+    assertFalse(sub.isSubscribed())
+    let _ = sub.cmd(["GET", "anything"])!
+    writer.close()
+    sub.close()
+}
+
+fn testPatternSubscribe(): void {
+    var sub = conn()
+    var writer = conn()
+    sub.psubscribe(["t:news:*"])!
+    assertEqual64(writer.publish("t:news:sport", "goal")!, 1)
+    match sub.nextMessage(3000)! {
+        Option.Some(m) => {
+            assertStrEqual(m.kind, "pmessage")
+            assertStrEqual(m.pattern, "t:news:*")
+            assertStrEqual(m.channel, "t:news:sport")
+            assertStrEqual(m.payload, "goal")
+        }
+        Option.None => {
+            assertMsg(false, "no pattern message arrived within 3s")
+        }
+    }
+    sub.punsubscribe(["t:news:*"])!
+    writer.close()
+    sub.close()
+}
+
+// A wait that expires is Ok(None), not an error — a subscriber with nothing to
+// read is the normal state, not a failure.
+fn testNextMessageTimesOut(): void {
+    var sub = conn()
+    sub.subscribe(["t:pubsub:quiet"])!
+    assertTrue(sub.nextMessage(200)!.isNone())
+    sub.close()
+}
+
+// Binary payloads survive pub/sub too — the same length prefixing as everywhere.
+fn testPubSubBinaryPayload(): void {
+    var sub = conn()
+    var writer = conn()
+    let channel = "t:pubsub:binary"
+    sub.subscribe([channel.clone()])!
+
+    var payload: string = ""
+    payload.push(0 as u8)
+    payload.push(255 as u8)
+    payload.pushStr("\r\n")
+    payload.push(0 as u8)
+    let _ = writer.publish(channel, payload)!
+
+    match sub.nextMessage(3000)! {
+        Option.Some(m) => {
+            assertEqual64(m.payload.len, payload.len)
+            var same = true
+            for i in 0..payload.len {
+                if m.payload[i] != payload[i] {
+                    same = false
+                }
+            }
+            assertMsg(same, "a binary pub/sub payload did not round-trip")
+        }
+        Option.None => {
+            assertMsg(false, "no binary message arrived within 3s")
+        }
+    }
+    writer.close()
+    sub.close()
+}
+
+// ── Databases ────────────────────────────────────────────────────────────────
+
+// Database 9 is used by nothing else in this suite, so FLUSHDB here cannot race
+// another test.
+fn testSelectAndFlushDb(): void {
+    let u = parseUrl(url())!
+    var c = Conn.connect("redis://:" + u.password + "@" + u.host + ":" + u.port.toString() + "/9")!
+    assertEqual64(c.database(), 9)
+    c.set("t:db9:key", "value")!
+    assertTrue(c.exists("t:db9:key")!)
+    c.flushdb()!
+    assertFalse(c.exists("t:db9:key")!)
+    c.close()
+}
+
+// ── URL parsing (no server) ──────────────────────────────────────────────────
+
+fn testParseUrlDefaults(): void {
+    let u = parseUrl("redis://127.0.0.1")!
+    assertStrEqual(u.host, "127.0.0.1")
+    assertEqual64(u.port as i64, 6379)
+    assertEqual64(u.db, 0)
+    assertEqual64(u.protocol as i64, 3)
+    assertStrEqual(u.password, "")
+}
+
+fn testParseUrlFull(): void {
+    let u = parseUrl("redis://alice:s3cr3t@redis.example.com:6380/4?protocol=2&client_name=milo")!
+    assertStrEqual(u.host, "redis.example.com")
+    assertEqual64(u.port as i64, 6380)
+    assertStrEqual(u.username, "alice")
+    assertStrEqual(u.password, "s3cr3t")
+    assertEqual64(u.db, 4)
+    assertEqual64(u.protocol as i64, 2)
+    assertStrEqual(u.clientName, "milo")
+}
+
+// A password is the field most likely to contain URL punctuation, so it is the
+// one that has to survive percent-decoding.
+fn testParseUrlPercentEncodedPassword(): void {
+    let u = parseUrl("redis://:p%40ss%2Fword%3A1@127.0.0.1:6379")!
+    assertStrEqual(u.password, "p@ss/word:1")
+    assertStrEqual(u.username, "")
+}
+
+fn testParseUrlNoColonIsPassword(): void {
+    // `redis://secret@host` — redis-cli reads the whole userinfo as a password.
+    let u = parseUrl("redis://secret@127.0.0.1:6379")!
+    assertStrEqual(u.password, "secret")
+    assertStrEqual(u.username, "")
+}
+
+fn testParseUrlRejectsBadInput(): void {
+    assertTrue(parseUrl("127.0.0.1:6379").isErr())
+    assertTrue(parseUrl("http://127.0.0.1:6379").isErr())
+    assertTrue(parseUrl("redis://127.0.0.1:0").isErr())
+    assertTrue(parseUrl("redis://127.0.0.1:99999").isErr())
+    assertTrue(parseUrl("redis://127.0.0.1:6379?protocol=4").isErr())
+    // TLS is not implemented; saying so beats a handshake failure that looks
+    // like a protocol bug.
+    match parseUrl("rediss://127.0.0.1:6379") {
+        Result.Ok(_) => {
+            assertMsg(false, "rediss:// was accepted but TLS is not implemented")
+        }
+        Result.Err(e) => {
+            assertContains(e.message, "TLS")
+        }
+    }
+}
+
+// ── Encoding ─────────────────────────────────────────────────────────────────
+
+// The encoder is what makes an argument one argument. A value containing a
+// space, a CRLF and a NUL still travels as a single length-prefixed bulk string.
+fn testEncodeCommandIsLengthPrefixed(): void {
+    var evil: string = "a b\r\n*1\r\n$4\r\nPING"
+    let encoded = encodeCommand(["SET", "k", evil.clone()])
+    assertTrue(encoded.startsWith("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$17\r\n"))
+    assertTrue(encoded.endsWith("\r\n"))
+    assertEqual64(evil.len, 17)
+}
+
+fn testErrorPrefixDecoding(): void {
+    let e = RedisError.fromWire("WRONGTYPE Operation against a key holding the wrong kind of value")
+    assertStrEqual(e.kind, "WRONGTYPE")
+    assertContains(e.message, "wrong kind")
+    let moved = RedisError.fromWire("MOVED 3999 127.0.0.1:6381")
+    assertStrEqual(moved.kind, "MOVED")
+    assertStrEqual(moved.message, "3999 127.0.0.1:6381")
+    let bare = RedisError.fromWire("NOSCRIPT")
+    assertStrEqual(bare.kind, "NOSCRIPT")
+    assertStrEqual(bare.message, "")
+    // Client-side kinds are distinguishable from anything Redis sends.
+    assertTrue(RedisError.connection("x").isLocal())
+    assertFalse(e.isLocal())
+}
+
+// RESP3 doubles include three names `parseF64` does not accept, and Redis really
+// does send them: a member scored `+inf` answers `,inf` under RESP3 and the bulk
+// string `inf` under RESP2. Both have to become an f64.
+fn testInfiniteScore(): void {
+    var c = conn()
+    let key = "t:zset:inf"
+    let _ = c.delOne(key)!
+    let _ = c.cmd(["ZADD", key.clone(), "+inf", "top"])!
+    let _ = c.cmd(["ZADD", key.clone(), "-inf", "bottom"])!
+    let top = c.zscore(key, "top")! ?? 0.0
+    let bottom = c.zscore(key, "bottom")! ?? 0.0
+    assertTrue(top > 1000000000000.0)
+    assertTrue(bottom < -1000000000000.0)
+    assertStrEqual(c.cmd(["ZSCORE", key.clone(), "top"])!.typeName(), "double")
+    c.close()
+
+    var c2 = openResp2()
+    assertStrEqual(c2.cmd(["ZSCORE", key.clone(), "top"])!.typeName(), "string")
+    assertTrue((c2.zscore(key, "top")! ?? 0.0) > 1000000000000.0)
+    let _ = c2.delOne(key)!
+    c2.close()
+}

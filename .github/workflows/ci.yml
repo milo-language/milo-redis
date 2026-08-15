@@ -1,0 +1,111 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # A real Redis as a service container, running the stock official image.
+  #
+  # The password is applied with CONFIG SET rather than a `--requirepass` flag,
+  # because GitHub's `services:` block has no way to pass command arguments to a
+  # container — `options` maps onto docker create flags, and `--entrypoint` takes
+  # an executable, not an argument list. Setting it afterwards gets the same
+  # thing: from that point on every connection must AUTH, so the client's
+  # handshake really executes and testNoAuthRejected has something to prove.
+  service-container:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:8
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      MILO_REDIS_URL: redis://:testpw@127.0.0.1:56379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install milo
+        run: |
+          mkdir -p "$HOME/.milo-bin"
+          curl -fsSL https://github.com/milo-language/milo/releases/download/latest/milo-linux-x64.tar.gz \
+            | tar xz -C "$HOME/.milo-bin" --strip-components=1   # archive wraps the binary in milo-<platform>/
+          chmod +x "$HOME/.milo-bin/milo"
+          echo "$HOME/.milo-bin" >> "$GITHUB_PATH"
+
+      - name: Install redis-cli
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+
+      - name: Turn on authentication
+        run: |
+          redis-cli -p 56379 config set requirepass testpw
+          # Verify it took: an unauthenticated PING must now be refused. Without
+          # this check a silently-ignored CONFIG SET would leave the whole job
+          # testing an open server while claiming to test AUTH.
+          redis-cli -p 56379 ping 2>&1 | grep -q NOAUTH
+
+      - name: Tests
+        run: milo test tests/redis_test.milo
+
+      # tests/protocol_test.milo is NOT run here. It drives `DEBUG PROTOCOL` to
+      # make the server emit RESP3's big-number, verbatim, boolean and attribute
+      # frames, and DEBUG is refused unless the server was STARTED with
+      # --enable-debug-command — a startup-only option this image is not given.
+      # The `harness` job below runs it against a server that has it. Naming that
+      # here rather than making the test skip itself: a protocol test that
+      # silently passes when the frames cannot be produced proves nothing.
+
+      - name: Example
+        run: milo run examples/cache.milo
+
+      # redis-cli is a second, independent implementation reading the keys the
+      # example just wrote. Without it the suite only proves the client agrees
+      # with itself.
+      - name: Cross-check the example's writes with redis-cli
+        run: |
+          q() { redis-cli -p 56379 -a testpw --no-auth-warning "$@"; }
+          test "$(q GET milo:greeting)" = "hello"
+          test "$(q GET milo:counter)" = "100"
+          test "$(q GET milo:tx)" = "committed"
+          test "$(q HGET milo:user name)" = "ada"
+          test "$(q ZSCORE milo:scores ada)" = "99.5"
+          test "$(q STRLEN milo:binary)" = "23"
+          q --no-raw GET milo:binary | grep -q '\\x00'
+
+  # The full local gate, byte for byte the command a developer runs. It needs a
+  # server started with --enable-debug-command, which scripts/test-server.sh
+  # passes and a service container cannot be given — so this job installs
+  # redis-server and lets the harness drive it.
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install milo
+        run: |
+          mkdir -p "$HOME/.milo-bin"
+          curl -fsSL https://github.com/milo-language/milo/releases/download/latest/milo-linux-x64.tar.gz \
+            | tar xz -C "$HOME/.milo-bin" --strip-components=1
+          chmod +x "$HOME/.milo-bin/milo"
+          echo "$HOME/.milo-bin" >> "$GITHUB_PATH"
+
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server redis-tools
+
+      # Ubuntu's package starts a system redis on 6379 at install time. The
+      # harness uses 56379, so the two do not collide, but stopping it keeps the
+      # runner honest about which server the tests reached.
+      - name: Stop the packaged system redis
+        run: sudo systemctl stop redis-server || true
+
+      - name: Full local gate (both suites + example + redis-cli cross-check)
+        run: sh scripts/run-tests.sh

@@ -1,0 +1,232 @@
+// RESP3's exotic frame types, driven by `DEBUG PROTOCOL <type>`.
+//
+// SEPARATE FILE ON PURPOSE. `DEBUG` is refused unless the server was STARTED
+// with `--enable-debug-command local`, which is a startup-only option — a stock
+// server cannot be talked into it afterwards. `scripts/test-server.sh` sets it,
+// so this file runs in the local gate and in CI's harness job; CI's
+// service-container job runs a stock image and skips this file. That split is
+// deliberate: a test that quietly passes when the server cannot produce the
+// frames it is testing would be worse than not having it.
+//
+// Without these, the big-number, verbatim, boolean and attribute branches of the
+// parser have no coverage at all — no ordinary Redis command emits them.
+from "../lib" import {
+    Conn, RedisValue, RedisError, parseUrl
+}
+from "std/env" import {
+    Env
+}
+from "std/testing" import {
+    assertTrue, assertFalse, assertEqual64, assertStrEqual, assertContains, assertMsg, assertNear
+}
+
+fn url(): string {
+    return Env.getOr("MILO_REDIS_URL", "redis://:testpw@127.0.0.1:56379/0")
+}
+
+fn conn(): Conn {
+    match Conn.connect(url()) {
+        Result.Ok(c) => {
+            return c
+        }
+        Result.Err(e) => {
+            assertMsg(false, "connect failed: " + e.toString())
+            return Conn.connect(url())!
+        }
+    }
+}
+
+fn connResp2(): Conn {
+    let u = url() + "?protocol=2"
+    match Conn.connect(u) {
+        Result.Ok(c) => {
+            return c
+        }
+        Result.Err(e) => {
+            assertMsg(false, "RESP2 connect failed: " + e.toString())
+            return Conn.connect(u)!
+        }
+    }
+}
+
+fn debugProtocol(c: &mut Conn, kind: &string): RedisValue {
+    match c.cmd(["DEBUG", "PROTOCOL", kind.clone()]) {
+        Result.Ok(v) => {
+            return v
+        }
+        Result.Err(e) => {
+            assertMsg(false, "DEBUG PROTOCOL " + kind + " failed: " + e.toString() + " — the server needs --enable-debug-command local (scripts/test-server.sh sets it)")
+            return RedisValue.Nil
+        }
+    }
+}
+
+// A guard for this whole file: if DEBUG is unavailable, every other test here
+// would fail with the same confusing message, so say why once and clearly.
+fn testDebugCommandIsAvailable(): void {
+    var c = conn()
+    match c.cmd(["DEBUG", "PROTOCOL", "integer"]) {
+        Result.Ok(v) => {
+            assertStrEqual(v.typeName(), "integer")
+        }
+        Result.Err(e) => {
+            assertMsg(false, "DEBUG is disabled on this server (" + e.toString() + "). Start it with scripts/test-server.sh, which passes --enable-debug-command local.")
+        }
+    }
+    c.close()
+}
+
+// ── Big numbers ──────────────────────────────────────────────────────────────
+
+// `(` — a number too wide for i64, which is exactly why the variant keeps its
+// digits as text rather than parsing them.
+fn testBigNumber(): void {
+    var c = conn()
+    let v = debugProtocol(c, "bignum")
+    assertStrEqual(v.typeName(), "bignum")
+    assertStrEqual(v.asStr() ?? "", "1234567999999999999999999999999999999")
+    // 37 digits: far past i64, so asI64 must decline rather than truncate.
+    assertEqual64((v.asStr() ?? "").len, 37)
+    assertTrue(v.asI64().isNone())
+    c.close()
+
+    // RESP2 has no big-number type and sends the same digits as a bulk string.
+    var c2 = connResp2()
+    let v2 = debugProtocol(c2, "bignum")
+    assertStrEqual(v2.typeName(), "string")
+    assertStrEqual(v2.text(), v.text())
+    c2.close()
+}
+
+// ── Booleans ─────────────────────────────────────────────────────────────────
+
+// `#t` / `#f` in RESP3, `:1` / `:0` in RESP2. asBool() gives the same answer.
+fn testBooleans(): void {
+    var c = conn()
+    let t = debugProtocol(c, "true")
+    let f = debugProtocol(c, "false")
+    assertStrEqual(t.typeName(), "boolean")
+    assertStrEqual(f.typeName(), "boolean")
+    assertTrue(t.asBool() ?? false)
+    assertFalse(f.asBool() ?? true)
+    // text() renders as RESP2 would have, so output does not change with the
+    // handshake.
+    assertStrEqual(t.text(), "1")
+    assertStrEqual(f.text(), "0")
+    c.close()
+
+    var c2 = connResp2()
+    let t2 = debugProtocol(c2, "true")
+    let f2 = debugProtocol(c2, "false")
+    assertStrEqual(t2.typeName(), "integer")
+    assertTrue(t2.asBool() ?? false)
+    assertFalse(f2.asBool() ?? true)
+    assertStrEqual(t2.text(), t.text())
+    assertStrEqual(f2.text(), f.text())
+    c2.close()
+}
+
+// ── Verbatim strings ─────────────────────────────────────────────────────────
+
+// `=` carries a three-byte format hint — `txt:` — that RESP2's bulk string does
+// not. Dropping the hint is what makes the text identical under both.
+fn testVerbatimString(): void {
+    var c = conn()
+    let v = debugProtocol(c, "verbatim")
+    assertStrEqual(v.typeName(), "verbatim")
+    let text = v.asStr() ?? ""
+    assertStrEqual(text, "This is a verbatim\nstring")
+    // The payload contains a newline, which the length prefix carries fine.
+    assertContains(text, "\n")
+    c.close()
+
+    var c2 = connResp2()
+    let v2 = debugProtocol(c2, "verbatim")
+    assertStrEqual(v2.typeName(), "string")
+    assertStrEqual(v2.text(), text)
+    c2.close()
+}
+
+// ── Doubles ──────────────────────────────────────────────────────────────────
+
+fn testDouble(): void {
+    var c = conn()
+    let v = debugProtocol(c, "double")
+    assertStrEqual(v.typeName(), "double")
+    assertNear(v.asF64() ?? 0.0, 3.141, 0.000001)
+    c.close()
+
+    var c2 = connResp2()
+    let v2 = debugProtocol(c2, "double")
+    assertStrEqual(v2.typeName(), "string")
+    assertNear(v2.asF64() ?? 0.0, 3.141, 0.000001)
+    c2.close()
+}
+
+// ── Null ─────────────────────────────────────────────────────────────────────
+
+// `_` in RESP3, `$-1` in RESP2. Two wire spellings, one value.
+fn testNullFrame(): void {
+    var c = conn()
+    let v = debugProtocol(c, "null")
+    assertStrEqual(v.typeName(), "nil")
+    assertTrue(v.isNil())
+    c.close()
+
+    var c2 = connResp2()
+    let v2 = debugProtocol(c2, "null")
+    assertStrEqual(v2.typeName(), "nil")
+    assertTrue(v2.isNil())
+    c2.close()
+}
+
+// ── Attributes ───────────────────────────────────────────────────────────────
+
+// `|` is metadata attached to the next reply, NOT a reply. A parser that
+// returned it would answer every later command one frame early — so the test is
+// that the attribute is consumed and the real reply comes back in its place.
+fn testAttributeFrameIsSkipped(): void {
+    var c = conn()
+    let v = debugProtocol(c, "attrib")
+    assertStrEqual(v.typeName(), "string")
+    assertStrEqual(v.text(), "Some real reply following the attribute")
+    // The connection is still in step afterwards.
+    assertStrEqual(c.ping()!, "PONG")
+    assertEqual64(c.cmd(["DEBUG", "PROTOCOL", "integer"])!.asI64() ?? 0, 12345)
+    c.close()
+}
+
+// ── Aggregates ───────────────────────────────────────────────────────────────
+
+fn testDebugMapAndSet(): void {
+    var c = conn()
+    let m = debugProtocol(c, "map")
+    assertStrEqual(m.typeName(), "map")
+    assertEqual64(m.len(), 3)
+    let pairs = m.asPairs()
+    assertEqual64(pairs.len(), 3)
+    assertStrEqual(pairs[0].key, "0")
+
+    let s = debugProtocol(c, "set")
+    assertStrEqual(s.typeName(), "set")
+    assertEqual64(s.len(), 3)
+    assertEqual64(s.asStrings().len(), 3)
+
+    let a = debugProtocol(c, "array")
+    assertStrEqual(a.typeName(), "array")
+    assertEqual64(a.len(), 3)
+    c.close()
+
+    // Under RESP2 the map is a flat array of the same content, and asPairs()
+    // gives the same pairs — the normalisation, checked on a second command.
+    var c2 = connResp2()
+    let m2 = debugProtocol(c2, "map")
+    assertStrEqual(m2.typeName(), "array")
+    let pairs2 = m2.asPairs()
+    assertEqual64(pairs2.len(), pairs.len())
+    for i in 0..pairs2.len() {
+        assertStrEqual(pairs2[i].key, pairs[i].key)
+        assertStrEqual(pairs2[i].text(), pairs[i].text())
+    }
+    c2.close()
+}
