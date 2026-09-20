@@ -82,7 +82,7 @@ fn testDebugCommandIsAvailable(): void {
 // digits as text rather than parsing them.
 fn testBigNumber(): void {
     var c = conn()
-    let v = debugProtocol(c, "bignum")
+    let v = debugProtocol(&mut c, "bignum")
     assertStrEqual(v.typeName(), "bignum")
     assertStrEqual(v.asStr() ?? "", "1234567999999999999999999999999999999")
     // 37 digits: far past i64, so asI64 must decline rather than truncate.
@@ -92,7 +92,7 @@ fn testBigNumber(): void {
 
     // RESP2 has no big-number type and sends the same digits as a bulk string.
     var c2 = connResp2()
-    let v2 = debugProtocol(c2, "bignum")
+    let v2 = debugProtocol(&mut c2, "bignum")
     assertStrEqual(v2.typeName(), "string")
     assertStrEqual(v2.text(), v.text())
     c2.close()
@@ -103,8 +103,8 @@ fn testBigNumber(): void {
 // `#t` / `#f` in RESP3, `:1` / `:0` in RESP2. asBool() gives the same answer.
 fn testBooleans(): void {
     var c = conn()
-    let t = debugProtocol(c, "true")
-    let f = debugProtocol(c, "false")
+    let t = debugProtocol(&mut c, "true")
+    let f = debugProtocol(&mut c, "false")
     assertStrEqual(t.typeName(), "boolean")
     assertStrEqual(f.typeName(), "boolean")
     assertTrue(t.asBool() ?? false)
@@ -116,8 +116,8 @@ fn testBooleans(): void {
     c.close()
 
     var c2 = connResp2()
-    let t2 = debugProtocol(c2, "true")
-    let f2 = debugProtocol(c2, "false")
+    let t2 = debugProtocol(&mut c2, "true")
+    let f2 = debugProtocol(&mut c2, "false")
     assertStrEqual(t2.typeName(), "integer")
     assertTrue(t2.asBool() ?? false)
     assertFalse(f2.asBool() ?? true)
@@ -132,7 +132,7 @@ fn testBooleans(): void {
 // not. Dropping the hint is what makes the text identical under both.
 fn testVerbatimString(): void {
     var c = conn()
-    let v = debugProtocol(c, "verbatim")
+    let v = debugProtocol(&mut c, "verbatim")
     assertStrEqual(v.typeName(), "verbatim")
     let text = v.asStr() ?? ""
     assertStrEqual(text, "This is a verbatim\nstring")
@@ -141,7 +141,7 @@ fn testVerbatimString(): void {
     c.close()
 
     var c2 = connResp2()
-    let v2 = debugProtocol(c2, "verbatim")
+    let v2 = debugProtocol(&mut c2, "verbatim")
     assertStrEqual(v2.typeName(), "string")
     assertStrEqual(v2.text(), text)
     c2.close()
@@ -151,13 +151,13 @@ fn testVerbatimString(): void {
 
 fn testDouble(): void {
     var c = conn()
-    let v = debugProtocol(c, "double")
+    let v = debugProtocol(&mut c, "double")
     assertStrEqual(v.typeName(), "double")
     assertNear(v.asF64() ?? 0.0, 3.141, 0.000001)
     c.close()
 
     var c2 = connResp2()
-    let v2 = debugProtocol(c2, "double")
+    let v2 = debugProtocol(&mut c2, "double")
     assertStrEqual(v2.typeName(), "string")
     assertNear(v2.asF64() ?? 0.0, 3.141, 0.000001)
     c2.close()
@@ -168,13 +168,13 @@ fn testDouble(): void {
 // `_` in RESP3, `$-1` in RESP2. Two wire spellings, one value.
 fn testNullFrame(): void {
     var c = conn()
-    let v = debugProtocol(c, "null")
+    let v = debugProtocol(&mut c, "null")
     assertStrEqual(v.typeName(), "nil")
     assertTrue(v.isNil())
     c.close()
 
     var c2 = connResp2()
-    let v2 = debugProtocol(c2, "null")
+    let v2 = debugProtocol(&mut c2, "null")
     assertStrEqual(v2.typeName(), "nil")
     assertTrue(v2.isNil())
     c2.close()
@@ -187,7 +187,7 @@ fn testNullFrame(): void {
 // that the attribute is consumed and the real reply comes back in its place.
 fn testAttributeFrameIsSkipped(): void {
     var c = conn()
-    let v = debugProtocol(c, "attrib")
+    let v = debugProtocol(&mut c, "attrib")
     assertStrEqual(v.typeName(), "string")
     assertStrEqual(v.text(), "Some real reply following the attribute")
     // The connection is still in step afterwards.
@@ -200,19 +200,19 @@ fn testAttributeFrameIsSkipped(): void {
 
 fn testDebugMapAndSet(): void {
     var c = conn()
-    let m = debugProtocol(c, "map")
+    let m = debugProtocol(&mut c, "map")
     assertStrEqual(m.typeName(), "map")
     assertEqual64(m.len(), 3)
     let pairs = m.asPairs()
     assertEqual64(pairs.len(), 3)
     assertStrEqual(pairs[0].key, "0")
 
-    let s = debugProtocol(c, "set")
+    let s = debugProtocol(&mut c, "set")
     assertStrEqual(s.typeName(), "set")
     assertEqual64(s.len(), 3)
     assertEqual64(s.asStrings().len(), 3)
 
-    let a = debugProtocol(c, "array")
+    let a = debugProtocol(&mut c, "array")
     assertStrEqual(a.typeName(), "array")
     assertEqual64(a.len(), 3)
     c.close()
@@ -220,7 +220,7 @@ fn testDebugMapAndSet(): void {
     // Under RESP2 the map is a flat array of the same content, and asPairs()
     // gives the same pairs — the normalisation, checked on a second command.
     var c2 = connResp2()
-    let m2 = debugProtocol(c2, "map")
+    let m2 = debugProtocol(&mut c2, "map")
     assertStrEqual(m2.typeName(), "array")
     let pairs2 = m2.asPairs()
     assertEqual64(pairs2.len(), pairs.len())
