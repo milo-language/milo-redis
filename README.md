@@ -28,7 +28,7 @@ Full API, the value model, transactions, pub/sub and error kinds:
 ## Installation
 
 ```bash
-milo add github.com/milo-language/milo-redis
+milo pkg add github.com/milo-language/milo-redis
 ```
 
 ```milo
