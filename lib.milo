@@ -889,12 +889,9 @@ impl RespStream {
         return Result.Ok(items)
     }
 
-    // Close the socket. Assigning over the field runs the old value's Drop,
-    // which is what actually closes the descriptor.
+    // Close the socket now; the stream is inert afterwards and its drop is a no-op.
     fn shutdown(self: &mut Self): void {
-        self.tcp = TcpStream {
-            fd: -1 as i32
-        }
+        self.tcp.close()
         self.buf = ""
         self.pos = 0
     }
@@ -1603,7 +1600,7 @@ impl Conn {
             // parsing it will not block for long; an empty buffer means we must
             // wait on the socket, and that wait is what the timeout bounds.
             if self.stream.buffered() == 0 {
-                if !waitReadable(self.stream.tcp.rawFd(), Duration.millis(timeoutMs)) {
+                if !waitReadable(self.stream.tcp, Duration.millis(timeoutMs)) {
                     return Result.Ok(Option.None)
                 }
             }
